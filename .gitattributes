@@ -1,0 +1,46 @@
+# Normalize line endings regardless of platform.
+* text=auto eol=lf
+
+# Markdown and source — treat as text, normalize to LF.
+*.md       text eol=lf
+*.java     text eol=lf
+*.ts       text eol=lf
+*.tsx      text eol=lf
+*.js       text eol=lf
+*.jsx      text eol=lf
+*.astro    text eol=lf
+*.json     text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.xml      text eol=lf
+*.css      text eol=lf
+*.properties text eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=crlf
+
+# Binary assets — never normalize, never diff as text.
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.svg      text eol=lf
+*.pdf      binary
+*.woff     binary
+*.woff2    binary
+*.ttf      binary
+*.otf      binary
+*.mp3      binary
+*.wav      binary
+*.flac     binary
+*.ogg      binary
+*.opus     binary
+
+# Reduce merge noise on generated artifacts.
+_site/         linguist-generated=true
+
+# Git export-ignore (don't include in archives).
+.github/    export-ignore

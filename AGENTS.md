@@ -5,7 +5,9 @@ Read this before doing anything else.
 
 ## What this project is
 
-Bounce is a self-hosted, Sonos-like whole-home audio system. A Spring Boot
-server acts as a Spotify Connect target (via librespot) and broadcasts the
-audio stream to lightweight GraalVM-native Java clients (e.g. on Pi Zeros
-attached to speakers). An Astro web UI controls which clients/zones play.
+Bounce is a self-hosted, Sonos-like whole-home audio system, built as a Rust
+workspace. The `server` crate acts as a Spotify Connect target (via
+librespot) and broadcasts the audio stream to lightweight clients (e.g. on
+Pi Zeros attached to speakers). The `web` crate is a Leptos UI that controls
+which clients/zones play and at what volume. The `common` crate holds the
+protocol and domain types shared across the workspace.

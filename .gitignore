@@ -6,5 +6,8 @@ devenv.local.yaml
 # direnv
 .direnv
 
+# Rust
+/target
+
 # pre-commit
 .pre-commit-config.yaml

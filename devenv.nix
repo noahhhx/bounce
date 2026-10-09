@@ -1,46 +1,46 @@
-{ pkgs, lib, config, inputs, ... }:
+{ pkgs, lib, config, ... }:
 
 {
-  # https://devenv.sh/basics/
-  env.GREET = "devenv";
-
   # https://devenv.sh/packages/
   packages = [ pkgs.git ];
 
-  # https://devenv.sh/languages/
-  # languages.rust.enable = true;
-
-  # https://devenv.sh/processes/
-  # processes.dev.exec = "${lib.getExe pkgs.watchexec} -n -- ls -la";
-
-  # https://devenv.sh/services/
-  # services.postgres.enable = true;
+  # https://devenv.sh/languages/rust/
+  languages.rust = {
+    enable = true;
+    channel = "stable";
+    components = [
+      "rustc"
+      "cargo"
+      "clippy"
+      "rustfmt"
+      "rust-analyzer"
+    ];
+  };
 
   # https://devenv.sh/scripts/
-  scripts.hello.exec = ''
-    echo hello from $GREET
-  '';
+  scripts.hello.exec = "echo hello from devenv";
 
-  # https://devenv.sh/basics/
-  enterShell = ''
-    hello         # Run scripts directly
-    git --version # Use packages
-  '';
-
-  # https://devenv.sh/tasks/
-  # tasks = {
-  #   "myproj:setup".exec = "mytool build";
-  #   "devenv:enterShell".after = [ "myproj:setup" ];
-  # };
+  # https://devenv.sh/git-hooks/
+  git-hooks.hooks = {
+    rustfmt = {
+      enable = true;
+      entry = "cargo fmt --all -- --check";
+      pass_filenames = false;
+      files = "\\.rs$";
+      language = "system";
+    };
+    clippy = {
+      enable = true;
+      entry = "cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic";
+      pass_filenames = false;
+      files = "\\.rs$";
+      language = "system";
+    };
+  };
 
   # https://devenv.sh/tests/
   enterTest = ''
-    echo "Running tests"
-    git --version | grep --color=auto "${pkgs.git.version}"
+    cargo clippy --version
+    cargo fmt --version
   '';
-
-  # https://devenv.sh/git-hooks/
-  # git-hooks.hooks.shellcheck.enable = true;
-
-  # See full reference at https://devenv.sh/reference/options/
 }

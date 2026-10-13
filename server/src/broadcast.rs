@@ -19,17 +19,24 @@ use crate::session::Outbox;
 const MAX_SLIP: Duration = Duration::from_millis(250);
 
 pub struct Broadcaster {
-    stream: StreamId,
-    format: AudioFormat,
     /// How far ahead of now each chunk's `play_at` is set. Bigger survives
     /// worse Wi-Fi; smaller makes play/pause feel responsive. Snapcast
     /// defaults to 1s.
     playout_delay: Duration,
+    /// `None` until the source starts its first stream.
+    stream: Option<Stream>,
+    /// Subscribers follow the source, not a stream, so they stay across
+    /// stream starts.
+    subscribers: HashMap<ClientId, Outbox>,
+}
+
+struct Stream {
+    id: StreamId,
+    format: AudioFormat,
     next_seq: u64,
     timeline: Option<Timeline>,
     /// Chunks whose `play_at` has not passed yet, replayed to late joiners.
     pending: VecDeque<AudioChunk>,
-    subscribers: HashMap<ClientId, Outbox>,
 }
 
 /// Counted in frames from a fixed start, so chunks that are not a whole
@@ -48,16 +55,25 @@ impl Timeline {
 
 impl Broadcaster {
     #[must_use]
-    pub fn new(stream: StreamId, format: AudioFormat, playout_delay: Duration) -> Self {
+    pub fn new(playout_delay: Duration) -> Self {
         Self {
-            stream,
-            format,
             playout_delay,
+            stream: None,
+            subscribers: HashMap::new(),
+        }
+    }
+
+    /// Replaces the current stream. Sequence numbers restart at 0 and the
+    /// old stream's pending chunks are dropped, so a late joiner never gets
+    /// audio from a stream that has ended.
+    pub fn start(&mut self, stream: StreamId, format: AudioFormat) {
+        self.stream = Some(Stream {
+            id: stream,
+            format,
             next_seq: 0,
             timeline: None,
             pending: VecDeque::new(),
-            subscribers: HashMap::new(),
-        }
+        });
     }
 
     /// Encodes, stamps, and sends to every subscriber. Each chunk plays
@@ -65,11 +81,16 @@ impl Broadcaster {
     /// The timeline restarts at `now + playout_delay` on the first chunk and
     /// whenever the source drifts more than [`MAX_SLIP`] from it, as after
     /// a pause. A subscriber whose outbox is full gets dropped chunks,
-    /// never backpressure, so one slow client can't stall a room.
+    /// never backpressure, so one slow client can't stall a room. Samples
+    /// before the first [`Broadcaster::start`] have no format and are
+    /// dropped.
     pub fn push_pcm(&mut self, samples: &[i16], now: ServerInstant) {
-        let rate = self.format.sample_rate;
+        let Some(stream) = &mut self.stream else {
+            return;
+        };
+        let rate = stream.format.sample_rate;
         let target = ServerInstant(now.0 + micros(self.playout_delay));
-        let timeline = match self.timeline {
+        let timeline = match stream.timeline {
             Some(t) if t.end(rate).0.abs_diff(target.0) <= micros(MAX_SLIP) => t,
             _ => Timeline {
                 start: target,
@@ -77,31 +98,31 @@ impl Broadcaster {
             },
         };
         let chunk = AudioChunk {
-            stream: self.stream,
-            seq: self.next_seq,
+            stream: stream.id,
+            seq: stream.next_seq,
             play_at: timeline.end(rate),
-            data: self.encode(samples),
+            data: encode(stream.format.codec, samples),
         };
-        let frames = samples.len() / usize::from(self.format.channels);
-        self.timeline = Some(Timeline {
+        let frames = samples.len() / usize::from(stream.format.channels);
+        stream.timeline = Some(Timeline {
             frames: timeline.frames + frames as u64,
             ..timeline
         });
-        self.next_seq += 1;
+        stream.next_seq += 1;
 
-        while self.pending.front().is_some_and(|c| c.play_at <= now) {
-            self.pending.pop_front();
+        while stream.pending.front().is_some_and(|c| c.play_at <= now) {
+            stream.pending.pop_front();
         }
         for outbox in self.subscribers.values() {
             outbox.audio(chunk.clone());
         }
-        self.pending.push_back(chunk);
+        stream.pending.push_back(chunk);
     }
 
     /// A late joiner receives the chunks still ahead of their deadline, so
     /// it starts in sync instead of waiting a full playout delay.
     pub fn subscribe(&mut self, client: ClientId, outbox: Outbox) {
-        for chunk in &self.pending {
+        for chunk in self.stream.iter().flat_map(|s| &s.pending) {
             outbox.audio(chunk.clone());
         }
         self.subscribers.insert(client, outbox);
@@ -110,12 +131,12 @@ impl Broadcaster {
     pub fn unsubscribe(&mut self, client: &ClientId) {
         self.subscribers.remove(client);
     }
+}
 
-    fn encode(&self, samples: &[i16]) -> Vec<u8> {
-        match self.format.codec {
-            Codec::PcmS16Le => samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
-            Codec::Flac | Codec::Opus => todo!(),
-        }
+fn encode(codec: Codec, samples: &[i16]) -> Vec<u8> {
+    match codec {
+        Codec::PcmS16Le => samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
+        Codec::Flac | Codec::Opus => todo!(),
     }
 }
 
@@ -131,13 +152,16 @@ mod tests {
 
     const TEN_MS: [i16; 2 * 480] = [0; 2 * 480];
 
+    const FORMAT: AudioFormat = AudioFormat {
+        sample_rate: 48_000,
+        channels: 2,
+        codec: Codec::PcmS16Le,
+    };
+
     fn broadcaster() -> Broadcaster {
-        let format = AudioFormat {
-            sample_rate: 48_000,
-            channels: 2,
-            codec: Codec::PcmS16Le,
-        };
-        Broadcaster::new(StreamId(7), format, Duration::from_secs(1))
+        let mut b = Broadcaster::new(Duration::from_secs(1));
+        b.start(StreamId(7), FORMAT);
+        b
     }
 
     fn client(n: u8) -> ClientId {
@@ -219,6 +243,39 @@ mod tests {
         assert_eq!(received, 300);
         let stalled_seqs: Vec<u64> = drain(&mut stalled).iter().map(|c| c.seq).collect();
         assert_eq!(stalled_seqs, (0..256).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_new_stream_keeps_subscribers_and_restarts_its_sequence() {
+        let mut b = broadcaster();
+        let mut audio = subscribe(&mut b, 1);
+        b.push_pcm(&TEN_MS, at_ms(0));
+        b.push_pcm(&TEN_MS, at_ms(10));
+        b.start(StreamId(8), FORMAT);
+        b.push_pcm(&TEN_MS, at_ms(20));
+        let chunks: Vec<(StreamId, u64)> = drain(&mut audio)
+            .iter()
+            .map(|c| (c.stream, c.seq))
+            .collect();
+        assert_eq!(
+            chunks,
+            [(StreamId(7), 0), (StreamId(7), 1), (StreamId(8), 0)]
+        );
+
+        let mut late = subscribe(&mut b, 2);
+        let replayed: Vec<StreamId> = drain(&mut late).iter().map(|c| c.stream).collect();
+        assert_eq!(replayed, [StreamId(8)]);
+    }
+
+    #[test]
+    fn samples_before_any_stream_are_dropped() {
+        let mut b = Broadcaster::new(Duration::from_secs(1));
+        let mut audio = subscribe(&mut b, 1);
+        b.push_pcm(&TEN_MS, at_ms(0));
+        b.start(StreamId(7), FORMAT);
+        b.push_pcm(&TEN_MS, at_ms(10));
+        let seqs: Vec<u64> = drain(&mut audio).iter().map(|c| c.seq).collect();
+        assert_eq!(seqs, [0]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use super::{Source, SourceControl, SourceEvent, SourceKind, SourceOutput};
+use super::{Source, SourceControl, SourceKind, SourceOutput};
 
 const CHUNKS_PER_SECOND: u32 = 100;
 const SINE_PEAK: i16 = 3_000;
@@ -37,6 +37,10 @@ impl Source for TestToneSource {
         SourceKind::TestTone
     }
 
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
     fn start(&mut self, out: SourceOutput) {
         let tone = Tone::new(self.config.frequency_hz, self.config.sample_rate);
         self.task = Some(tokio::spawn(play(tone, out)));
@@ -54,10 +58,7 @@ impl Source for TestToneSource {
 }
 
 async fn play(mut tone: Tone, out: SourceOutput) {
-    out.event(SourceEvent::Started {
-        sample_rate: tone.sample_rate,
-        channels: 2,
-    });
+    out.start_stream(tone.sample_rate, 2);
     let frames = tone.sample_rate / CHUNKS_PER_SECOND;
     let mut tick = tokio::time::interval(Duration::from_secs(1) / CHUNKS_PER_SECOND);
     loop {
@@ -119,11 +120,16 @@ fn sine(cycles: f64) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use bounce_common::ids::SourceId;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    use bounce_common::audio::{AudioFormat, Codec};
+    use bounce_common::ids::{SourceId, StreamId};
     use tokio::sync::mpsc;
 
     use super::*;
     use crate::hub::HubEvent;
+    use crate::source::{Pcm, SourceEvent};
 
     #[test]
     fn clicks_full_scale_for_5ms_at_each_whole_second() {
@@ -161,22 +167,29 @@ mod tests {
             frequency_hz: 440,
             sample_rate: 48_000,
         });
-        source.start(SourceOutput::new(SourceId(0), events, pcm));
+        let streams = Arc::new(AtomicU64::new(9));
+        source.start(SourceOutput::new(SourceId(0), events, pcm, streams));
 
         tokio::time::sleep(Duration::from_millis(995)).await;
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            codec: Codec::PcmS16Le,
+        };
         let started = events_rx.try_recv().expect("Started sent");
         assert!(matches!(
             started,
             HubEvent::Source {
-                event: SourceEvent::Started {
-                    sample_rate: 48_000,
-                    channels: 2
-                },
+                event: SourceEvent::Started { stream: StreamId(9), format: f },
                 ..
-            }
+            } if f == format
+        ));
+        assert!(matches!(
+            pcm_rx.try_recv(),
+            Ok(Pcm::Start { stream: StreamId(9), format: f }) if f == format
         ));
         let mut samples = 0;
-        while let Ok(chunk) = pcm_rx.try_recv() {
+        while let Ok(Pcm::Samples(chunk)) = pcm_rx.try_recv() {
             samples += chunk.len();
         }
         assert_eq!(samples, 2 * 48_000);

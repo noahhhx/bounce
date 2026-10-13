@@ -1,16 +1,23 @@
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use bounce_common::ids::SourceId;
+use bounce_server::broadcast::Broadcaster;
+use bounce_server::clock;
 use bounce_server::config::{Config, READY_PREFIX};
 use bounce_server::hub::HubEvent;
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
-use bounce_server::source::{Source, SourceConfig, SourceOutput};
+use bounce_server::source::{Pcm, Source, SourceConfig, SourceOutput};
+
+/// Snapcast's default.
+const PLAYOUT_DELAY: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() {
@@ -32,16 +39,22 @@ async fn main() {
     );
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
+    let streams = Arc::new(AtomicU64::new(unix_micros()));
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
     for (id, source_config) in (0..).zip(config.sources) {
         let id = SourceId(id);
         let (pcm_tx, pcm_rx) = mpsc::unbounded_channel();
-        tokio::spawn(meter(id, pcm_rx));
+        tokio::spawn(broadcast(id, pcm_rx));
         let mut source: Box<dyn Source> = match source_config {
             SourceConfig::Spotify(c) => Box::new(SpotifySource::new(c)),
             SourceConfig::TestTone(c) => Box::new(TestToneSource::new(c)),
         };
-        source.start(SourceOutput::new(id, events_tx.clone(), pcm_tx));
+        source.start(SourceOutput::new(
+            id,
+            events_tx.clone(),
+            pcm_tx,
+            streams.clone(),
+        ));
         sources.push(source);
     }
 
@@ -67,25 +80,25 @@ async fn main() {
     }
 }
 
-/// Stands in for the broadcaster. Silent seconds are skipped so an idle
-/// server doesn't log every second.
-async fn meter(source: SourceId, mut pcm: UnboundedReceiver<Vec<i16>>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let (mut samples, mut peak) = (0, 0);
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                if samples > 0 {
-                    info!("source {}: pcm samples={samples} peak={peak}", source.0);
-                }
-                (samples, peak) = (0, 0);
+/// Nothing subscribes yet: only sessions produce an outbox.
+async fn broadcast(source: SourceId, mut pcm: UnboundedReceiver<Pcm>) {
+    let mut broadcaster = Broadcaster::new(PLAYOUT_DELAY);
+    while let Some(pcm) = pcm.recv().await {
+        match pcm {
+            Pcm::Start { stream, format } => {
+                info!("source {}: stream {} {format:?}", source.0, stream.0);
+                broadcaster.start(stream, format);
             }
-            Some(chunk) = pcm.recv() => {
-                samples += chunk.len();
-                peak = chunk.iter().map(|s| s.unsigned_abs()).fold(peak, u16::max);
-            }
+            Pcm::Samples(samples) => broadcaster.push_pcm(&samples, clock::now()),
         }
     }
+}
+
+fn unix_micros() -> u64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(since_epoch.as_micros()).unwrap_or(u64::MAX)
 }
 
 async fn bind(flag: &str, addr: SocketAddr) -> TcpListener {

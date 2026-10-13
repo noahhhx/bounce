@@ -83,6 +83,10 @@ impl Source for SpotifySource {
         SourceKind::Spotify
     }
 
+    fn name(&self) -> &str {
+        &self.config.device_name
+    }
+
     fn start(&mut self, out: SourceOutput) {
         let (controls, controls_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(
@@ -231,10 +235,7 @@ fn forward(out: &SourceOutput, started: &mut bool, event: SourceEvent) {
         SourceEvent::VolumeChanged(_) => {}
         _ if !*started => {
             *started = true;
-            out.event(SourceEvent::Started {
-                sample_rate: SAMPLE_RATE,
-                channels: NUM_CHANNELS,
-            });
+            out.start_stream(SAMPLE_RATE, NUM_CHANNELS);
         }
         _ => {}
     }
@@ -335,15 +336,19 @@ impl Sink for PacedSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use bounce_common::ids::SourceId;
 
     use super::*;
+    use crate::source::Pcm;
 
     #[test]
     fn sink_plays_at_real_time_and_resumes_without_bursting() {
         let (events, _events) = mpsc::unbounded_channel();
         let (pcm, mut received) = mpsc::unbounded_channel();
-        let mut sink = PacedSink::new(SourceOutput::new(SourceId(0), events, pcm));
+        let streams = Arc::new(AtomicU64::new(0));
+        let mut sink = PacedSink::new(SourceOutput::new(SourceId(0), events, pcm, streams));
         let mut converter = Converter::new(None);
         let mut play_one_second = || {
             let begun = Instant::now();
@@ -368,7 +373,7 @@ mod tests {
             "second after a pause took {after_pause:?}"
         );
         let mut samples = 0;
-        while let Ok(chunk) = received.try_recv() {
+        while let Ok(Pcm::Samples(chunk)) = received.try_recv() {
             samples += chunk.len();
         }
         assert_eq!(samples, 2 * 2 * 44_100);

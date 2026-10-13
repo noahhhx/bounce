@@ -20,6 +20,7 @@
 )]
 
 pub mod broadcast;
+pub mod clock;
 pub mod config;
 pub mod fleet;
 pub mod health;

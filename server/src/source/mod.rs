@@ -5,13 +5,16 @@
 pub mod spotify;
 pub mod test_tone;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use bounce_common::ids::SourceId;
+use bounce_common::audio::{AudioFormat, Codec};
+use bounce_common::ids::{SourceId, StreamId};
 use bounce_common::zone::Volume;
 
 use self::spotify::SpotifyConfig;
@@ -22,6 +25,9 @@ use crate::hub::HubEvent;
 /// it is decided in the web UI, not the casting app.
 pub trait Source: Send {
     fn kind(&self) -> SourceKind;
+
+    /// The device name its casting app shows.
+    fn name(&self) -> &str;
 
     /// Start advertising. Audio and events go to `out` until [`Source::stop`].
     fn start(&mut self, out: SourceOutput);
@@ -58,28 +64,58 @@ pub struct SourceOutput {
     /// Unbounded because the source paces itself to real time: the queue
     /// only grows while the broadcaster stalls, and a source never blocks
     /// or loses audio on a momentary stall.
-    pcm: UnboundedSender<Vec<i16>>,
+    pcm: UnboundedSender<Pcm>,
+    streams: Arc<AtomicU64>,
+}
+
+/// What a source sends its broadcaster. A stream start rides the same
+/// channel as the samples, so the broadcaster sees it before the stream's
+/// first chunk. The hub hears of it on another channel, with no ordering.
+pub enum Pcm {
+    Start {
+        stream: StreamId,
+        format: AudioFormat,
+    },
+    Samples(Vec<i16>),
 }
 
 impl SourceOutput {
+    /// `streams` hands out [`StreamId`]s and is shared by every source. Seed
+    /// it from the wall clock, so a client reconnecting to a restarted
+    /// server never mistakes a new stream for the one it was playing.
     #[must_use]
     pub fn new(
         source: SourceId,
         events: UnboundedSender<HubEvent>,
-        pcm: UnboundedSender<Vec<i16>>,
+        pcm: UnboundedSender<Pcm>,
+        streams: Arc<AtomicU64>,
     ) -> Self {
         Self {
             source,
             events,
             pcm,
+            streams,
         }
     }
 
-    /// Interleaved samples in the format of the last [`SourceEvent::Started`].
-    /// Call at the rate the audio plays: the broadcaster stamps each chunk's
-    /// play time on arrival.
+    /// Mints a stream id and announces it to the broadcaster, then the hub.
+    /// The codec is always `PcmS16Le`, the only one the broadcaster encodes.
+    pub fn start_stream(&self, sample_rate: u32, channels: u8) {
+        let stream = StreamId(self.streams.fetch_add(1, Ordering::Relaxed));
+        let format = AudioFormat {
+            sample_rate,
+            channels,
+            codec: Codec::PcmS16Le,
+        };
+        let _ = self.pcm.send(Pcm::Start { stream, format });
+        self.event(SourceEvent::Started { stream, format });
+    }
+
+    /// Interleaved samples in the format of the last
+    /// [`SourceOutput::start_stream`]. Call at the rate the audio plays: the
+    /// broadcaster stamps each chunk's play time on arrival.
     pub fn pcm(&self, samples: &[i16]) {
-        let _ = self.pcm.send(samples.to_vec());
+        let _ = self.pcm.send(Pcm::Samples(samples.to_vec()));
     }
 
     pub fn event(&self, event: SourceEvent) {
@@ -92,9 +128,11 @@ impl SourceOutput {
 
 #[derive(Debug, Clone)]
 pub enum SourceEvent {
+    /// Sources call [`SourceOutput::start_stream`] rather than building
+    /// this, so the broadcaster always hears of the stream too.
     Started {
-        sample_rate: u32,
-        channels: u8,
+        stream: StreamId,
+        format: AudioFormat,
     },
     Track(TrackMetadata),
     Paused,

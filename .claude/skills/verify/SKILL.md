@@ -34,6 +34,10 @@ change.
 - HTTP: `GET /api/state` returns `StateView` JSON. `POST /api/admin` takes
   one `AdminRequest` as serde's externally tagged JSON, such as
   `{"RouteZone":{"zone":1,"source":0}}`, and returns 202.
+  `GET /api/logs?client=<32 hex>&limit=<n>` returns that client's newest
+  `n` stored log records (default 100), newest last, as a JSON array of
+  `{boot, seq, wall_us, level, target, message, fields}`. `boot` is hex,
+  and a malformed query returns 400.
 - WAV sink: `stream-<id>.wav` (16-bit PCM, 44-byte header) next to
   `stream-<id>.timing` (`<first frame> <play_at us> <wall us>` per chunk,
   where `wall us` is when that frame plays on the host wall clock).

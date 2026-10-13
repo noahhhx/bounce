@@ -57,3 +57,4 @@ user-visible behavior. It then has exactly four H2 sections, in this order.
 - [Zones and routing](./zones.md) covers creating zones, moving speakers between them, and choosing what each zone plays.
 - [Volume](./volume.md) covers zone volume, source volume, and how they reach each speaker's output.
 - [Multi-room sync](./sync.md) covers speakers in zones on the same source playing the same audio at the same moment.
+- [Client logs](./logs.md) covers a speaker's log records reaching the server, surviving a server outage, and never arriving twice.

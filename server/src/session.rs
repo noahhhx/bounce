@@ -11,6 +11,12 @@ use bounce_common::protocol::ServerMessage;
 
 use crate::transport::Connection;
 
+/// Minted by the accept loop, one per connection. A client id survives a
+/// reconnect and a boot id survives a Wi-Fi drop, so only this tells a
+/// reconnected session from the half-open one it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub u64);
+
 /// The write side of a session, shared with the hub's effect runner and
 /// the broadcaster of whatever source the client's zone is playing.
 ///

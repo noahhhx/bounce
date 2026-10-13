@@ -21,6 +21,7 @@ use bounce_common::zone::{Volume, Zone};
 use crate::fleet::{ClientRecord, Fleet, Liveness, OfflineCause};
 use crate::health::{Alert, AlertKey, Thresholds};
 use crate::http::{ClientView, SourceView, StateView};
+use crate::session::SessionId;
 use crate::source::{SourceControl, SourceEvent, SourceKind, TrackMetadata};
 use crate::updates::ReleaseCatalog;
 
@@ -61,6 +62,7 @@ pub enum SourcePlayback {
 pub enum HubEvent {
     Connected {
         hello: Hello,
+        session: SessionId,
     },
     /// Everything except logs, which go to the telemetry store directly.
     Message {
@@ -69,6 +71,7 @@ pub enum HubEvent {
     },
     Disconnected {
         client: ClientId,
+        session: SessionId,
     },
     /// Fires every second. Drives heartbeat timeouts and time-based health
     /// rules, which no client message would otherwise trigger.
@@ -126,8 +129,7 @@ pub enum Effect {
         to: ClientId,
         message: ServerMessage,
     },
-    /// Sent after a `Rejected`, or when a heartbeat times out on a socket
-    /// that still looks open.
+    /// Sent when a heartbeat times out on a socket that still looks open.
     Close {
         client: ClientId,
     },
@@ -200,16 +202,19 @@ impl Hub {
         effects: &mut Vec<Effect>,
     ) -> Option<ClientId> {
         match event {
-            HubEvent::Connected { hello } => {
+            HubEvent::Connected { hello, session } => {
                 let client = hello.client.clone();
-                self.fleet.connected(hello, now);
+                self.fleet.connected(hello, session, now);
                 // The new session has a new outbox, so it needs a Subscribe
                 // even if the old session's was never withdrawn.
                 self.subscriptions.remove(&client);
                 return Some(client);
             }
-            HubEvent::Disconnected { client } => {
-                if let Some(record) = self.client_mut(&client) {
+            HubEvent::Disconnected { client, session } => {
+                // A replaced session's close can arrive after its
+                // replacement's connect, and must not take the client offline.
+                let current = |record: &&mut ClientRecord| matches!(record.liveness, Liveness::Online { session: s, .. } if s == session);
+                if let Some(record) = self.client_mut(&client).filter(current) {
                     record.liveness = Liveness::Offline {
                         since: now,
                         cause: OfflineCause::ConnectionClosed,
@@ -572,6 +577,20 @@ mod tests {
         }
     }
 
+    fn connected(n: u8, session: u64) -> HubEvent {
+        HubEvent::Connected {
+            hello: hello(n),
+            session: SessionId(session),
+        }
+    }
+
+    fn disconnected(n: u8, session: u64) -> HubEvent {
+        HubEvent::Disconnected {
+            client: client(n),
+            session: SessionId(session),
+        }
+    }
+
     fn secs(t0: Instant, s: u64) -> Instant {
         t0 + Duration::from_secs(s)
     }
@@ -583,7 +602,7 @@ mod tests {
     /// Client 1 in the kitchen, routed to the tone.
     fn routed(t0: Instant) -> (Hub, Vec<Effect>) {
         let mut hub = hub();
-        hub.handle(HubEvent::Connected { hello: hello(1) }, t0);
+        hub.handle(connected(1, 1), t0);
         let zone = AdminRequest::UpsertZone {
             zone: KITCHEN,
             name: "Kitchen".to_owned(),
@@ -767,8 +786,8 @@ mod tests {
         let (mut hub, _) = routed(t0);
         let before = hub.view().clients[0].desired.clone();
 
-        hub.handle(HubEvent::Disconnected { client: client(1) }, secs(t0, 1));
-        let effects = hub.handle(HubEvent::Connected { hello: hello(1) }, secs(t0, 2));
+        hub.handle(disconnected(1, 1), secs(t0, 1));
+        let effects = hub.handle(connected(1, 2), secs(t0, 2));
         assert_eq!(desired(&effects), [(client(1), before)]);
         assert_eq!(subscription_changes(&effects), [(true, TONE, client(1))]);
     }
@@ -777,13 +796,28 @@ mod tests {
     fn a_connect_over_a_half_open_session_subscribes_the_new_one() {
         let t0 = Instant::now();
         let (mut hub, _) = routed(t0);
-        let effects = hub.handle(HubEvent::Connected { hello: hello(1) }, secs(t0, 1));
+        let effects = hub.handle(connected(1, 2), secs(t0, 1));
         assert_eq!(subscription_changes(&effects), [(true, TONE, client(1))]);
     }
 
     #[test]
+    fn a_stale_disconnect_after_a_reconnect_keeps_the_client_online() {
+        let t0 = Instant::now();
+        let (mut hub, _) = routed(t0);
+        hub.handle(connected(1, 2), secs(t0, 1));
+
+        let stale = hub.handle(disconnected(1, 1), secs(t0, 2));
+        assert!(hub.view().clients[0].online);
+        assert_eq!(subscription_changes(&stale), []);
+
+        let current = hub.handle(disconnected(1, 2), secs(t0, 3));
+        assert!(!hub.view().clients[0].online);
+        assert_eq!(subscription_changes(&current), [(false, TONE, client(1))]);
+    }
+
+    #[test]
     fn a_first_connect_sends_a_real_revision_once() {
-        let effects = hub().handle(HubEvent::Connected { hello: hello(1) }, Instant::now());
+        let effects = hub().handle(connected(1, 1), Instant::now());
         let sent = desired(&effects);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1.revision, Revision(1));

@@ -10,6 +10,8 @@ use bounce_common::protocol::{DesiredState, Hello, Playback, ReportedState, Revi
 use bounce_common::telemetry::{Fault, Level, MetricsSample};
 use bounce_common::zone::Volume;
 
+use crate::session::SessionId;
+
 #[derive(Default)]
 pub struct Fleet {
     clients: HashMap<ClientId, ClientRecord>,
@@ -38,6 +40,9 @@ pub struct ClientRecord {
 
 pub enum Liveness {
     Online {
+        /// A `Disconnected` from any other session is stale: it comes from
+        /// the half-open socket this session replaced.
+        session: SessionId,
         boot: BootId,
         connected_at: Instant,
         /// Any message counts. Metrics arrive every few seconds, so a gap
@@ -73,8 +78,14 @@ impl Fleet {
     /// flips liveness to online. Returns the record so the hub can compute
     /// its desired state. A new record's desired state is a revision 0
     /// placeholder that the hub replaces before sending.
-    pub fn connected(&mut self, hello: Hello, now: Instant) -> &mut ClientRecord {
+    pub fn connected(
+        &mut self,
+        hello: Hello,
+        session: SessionId,
+        now: Instant,
+    ) -> &mut ClientRecord {
         let liveness = Liveness::Online {
+            session,
             boot: hello.boot,
             connected_at: now,
             last_heard: now,

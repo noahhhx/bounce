@@ -1,5 +1,5 @@
+use std::io::Read;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bounce_client::clock;
 use bounce_client::config::{Config, OutputBackend};
@@ -76,11 +76,14 @@ fn version_part(part: &str) -> u16 {
     part.parse().expect("crate version parts fit in u16")
 }
 
+/// Random rather than derived from the clock, which a Pi without an RTC
+/// reports identically on every boot until NTP syncs.
 fn boot_id() -> BootId {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-    BootId(nanos ^ (u64::from(std::process::id()) << 32))
+    let mut bytes = [0; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut bytes))
+        .expect("/dev/urandom is readable");
+    BootId(u64::from_le_bytes(bytes))
 }
 
 fn hostname() -> String {

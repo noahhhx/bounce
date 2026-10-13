@@ -1,1 +1,95 @@
-fn main() {}
+use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bounce_client::clock;
+use bounce_client::config::{Config, OutputBackend};
+use bounce_client::link::{Backoff, Link};
+use bounce_client::transport::Tcp;
+use bounce_client::Device;
+use bounce_common::audio::Codec;
+use bounce_common::ids::{BootId, Version};
+use bounce_common::protocol::{Hello, OutputDevice, PROTOCOL_VERSION};
+use bounce_common::update::Target;
+use tracing::info;
+
+#[cfg(target_arch = "aarch64")]
+const TARGET: Target = Target::Aarch64;
+/// Telling a Pi Zero's ARMv6 apart needs its own build target, which does
+/// not exist yet.
+#[cfg(target_arch = "arm")]
+const TARGET: Target = Target::ArmV7;
+#[cfg(target_arch = "x86_64")]
+const TARGET: Target = Target::X86_64;
+
+fn main() -> ExitCode {
+    let _ = clock::now();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+    let config = match Config::from_args(std::env::args().skip(1)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("bounce-client: {error:?}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(server) = config.server else {
+        eprintln!(
+            "bounce-client: --server <host:port> is required; finding the server over mDNS is not supported yet"
+        );
+        return ExitCode::from(2);
+    };
+
+    let hello = hello(&config);
+    info!(client = ?hello.client, boot = hello.boot.0, %server, "starting");
+    Link::new(Tcp, server, Backoff::default(), hello, Device::default()).run()
+}
+
+fn hello(config: &Config) -> Hello {
+    let output = match &config.output {
+        OutputBackend::Alsa => OutputDevice {
+            id: "default".into(),
+            description: "ALSA default device".into(),
+        },
+        OutputBackend::Wav { dir } => OutputDevice {
+            id: "wav".into(),
+            description: format!("WAV files in {}", dir.display()),
+        },
+    };
+    Hello {
+        protocol: PROTOCOL_VERSION,
+        client: config.client_id.clone(),
+        boot: boot_id(),
+        version: Version {
+            major: version_part(env!("CARGO_PKG_VERSION_MAJOR")),
+            minor: version_part(env!("CARGO_PKG_VERSION_MINOR")),
+            patch: version_part(env!("CARGO_PKG_VERSION_PATCH")),
+        },
+        target: TARGET,
+        hostname: hostname(),
+        outputs: vec![output],
+        codecs: vec![Codec::PcmS16Le],
+    }
+}
+
+fn version_part(part: &str) -> u16 {
+    part.parse().expect("crate version parts fit in u16")
+}
+
+/// Wall-clock nanoseconds mixed with the pid. The clock may be wrong on a
+/// Pi without NTP yet, but it still moves between starts, and the pid
+/// separates two starts in the same instant.
+fn boot_id() -> BootId {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    BootId(nanos ^ (u64::from(std::process::id()) << 32))
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|name| name.trim().to_owned())
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}

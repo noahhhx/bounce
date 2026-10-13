@@ -37,18 +37,16 @@ change.
 - WAV sink: `stream-<id>.wav` (16-bit PCM, 44-byte header) next to
   `stream-<id>.timing` (`<first frame> <play_at us>` per chunk).
 
-**Current status (2026-10-13).** `$B up` succeeds. The server binds both
-listeners, prints the ready line, and plays the test tone through its
-broadcaster, which its log shows as `source 0: stream <id> AudioFormat {..}`
-when the stream starts. `/api/state` answers, so `$B up --clients 0` gives
-a healthy doctor with a `stream=<id>` source line. Admin requests apply,
-and `$B wait` sees them in the next `/api/state`. With clients, `$B doctor`
-still reports NOT HEALTHY: the clients show `DOWN (exit 0)` because the
-client's `main` is still empty. The hub's `Send` and `Subscribe` effects
-wait on sessions, so no client receives desired state or audio yet. Once
-the client runs and sessions carry those effects, the rest works
-unchanged. The harness was checked end to end against stand-in binaries
-that follow the contract above.
+**Current status (2026-10-13).** `$B up --clients 2` gives a healthy
+doctor. Clients connect, converge on their desired state, stay online, and
+reconnect by themselves. Every step of [join](features/join.md) passes
+except the last part of a server restart: the server does not persist its
+fleet yet, so a client that is off during the restart is not listed
+afterwards. Routing a zone sends its clients `Playing` and subscribes them
+to the source's audio, but the client has no player yet. It reports
+`player=Idle` and writes no WAVs, so `$B peak` and `$B sync` have nothing
+to measure, and the audio steps of [sync](features/sync.md) and
+[volume](features/volume.md) cannot pass yet.
 
 ## Launch
 

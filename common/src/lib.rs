@@ -1,5 +1,3 @@
-#![expect(unused_variables, reason = "sketch: bodies are todo!()")]
-
 pub mod audio;
 pub mod ids;
 pub mod protocol;

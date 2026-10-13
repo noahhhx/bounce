@@ -21,6 +21,7 @@ pub fn now() -> SinceBoot {
     SinceBoot(origin().0.elapsed())
 }
 
+/// Only for the WAV sink. On a Pi the wall clock is wrong until NTP syncs.
 #[must_use]
 pub fn wall_origin_micros() -> u64 {
     let since_epoch = origin().1.duration_since(UNIX_EPOCH).unwrap_or_default();

@@ -106,8 +106,11 @@ struct WavStream {
     wall_origin_us: u64,
 }
 
+/// No resampling: the WAV sink is paced by the deadlines and loopback has no
+/// clock drift, so drift correction waits for a real DAC.
 const TOLERANCE: Duration = Duration::from_millis(1);
 const PERIOD: Duration = Duration::from_millis(10);
+/// WAV writes on a busy ext4 disk were measured blocking 26 to 180 ms.
 const MAX_BEHIND: Duration = Duration::from_millis(500);
 const NO_CLOCK_POLL: Duration = Duration::from_millis(10);
 const MAX_BUFFERED: usize = 1_000;

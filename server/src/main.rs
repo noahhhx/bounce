@@ -113,7 +113,7 @@ async fn main() {
     };
 
     let fleet_path = config.data_dir.join("fleet.json");
-    let saved = load_fleet(&config.data_dir, &fleet_path);
+    let saved = load_fleet_or_exit(&config.data_dir, &fleet_path);
     let session_listener = bind("--listen", config.listen).await;
     let http_listener = bind("--http", config.http).await;
     println!(
@@ -279,7 +279,7 @@ async fn broadcast(
     }
 }
 
-fn load_fleet(data_dir: &Path, path: &Path) -> Snapshot {
+fn load_fleet_or_exit(data_dir: &Path, path: &Path) -> Snapshot {
     if let Err(error) = std::fs::create_dir_all(data_dir) {
         eprintln!("bounce-server: {}: {error}", data_dir.display());
         std::process::exit(1);

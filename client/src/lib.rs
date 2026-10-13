@@ -2,6 +2,10 @@
 //!
 //! - The main thread runs the [`link::Link`] and the [`Device`]. It does
 //!   every non-audio thing.
+//! - The audio thread owns the [`player::Player`] and its output. It never
+//!   touches the network. It reads the clock offset and writes playback
+//!   counters through atomics, and sends state changes on a channel. Its
+//!   error logs take the log buffer's lock for one append.
 //! - The `tracing` layer writes into the shared [`telemetry::LogBuffer`]
 //!   from whatever thread logged.
 

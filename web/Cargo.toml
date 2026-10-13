@@ -1,4 +1,5 @@
 [package]
 name = "bounce-web"
+version.workspace = true
 edition = "2021"
 description = "Leptos control UI, served to the LAN for zone and volume control"

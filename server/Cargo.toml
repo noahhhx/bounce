@@ -1,5 +1,6 @@
 [package]
 name = "bounce-server"
+version.workspace = true
 edition = "2021"
 description = "Spotify Connect target (librespot) and broadcast hub for connected players"
 

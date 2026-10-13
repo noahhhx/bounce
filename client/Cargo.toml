@@ -1,5 +1,6 @@
 [package]
 name = "bounce-client"
+version.workspace = true
 edition = "2021"
 description = "Audio player for speaker-attached devices, receives the broadcast stream"
 

@@ -1,5 +1,6 @@
 [package]
 name = "bounce-common"
+version.workspace = true
 edition = "2021"
 description = "Shared protocol and domain types for server, clients, and web UI"
 

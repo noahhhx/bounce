@@ -68,6 +68,10 @@ fn says_hello_with_its_id_and_wav_output() {
     };
     assert_eq!(hello.protocol, PROTOCOL_VERSION);
     assert_eq!(hello.client, ClientId::parse(ID).unwrap());
+    let version = hello.version;
+    let version = format!("{}.{}.{}", version.major, version.minor, version.patch);
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    assert_ne!(version, "0.0.0", "the client crate has no version");
     assert_eq!(hello.outputs.len(), 1);
     assert_eq!(hello.outputs[0].id, "wav");
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();

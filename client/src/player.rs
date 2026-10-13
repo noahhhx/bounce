@@ -131,9 +131,12 @@ struct WavStream {
 const TOLERANCE: Duration = Duration::from_millis(1);
 /// Silence written at a time when the buffer is dry.
 const PERIOD: Duration = Duration::from_millis(10);
-/// Further behind than this, as after the process was stopped, the output
-/// skips to now in one write instead of replaying the stall period by period.
-const MAX_BEHIND: Duration = Duration::from_millis(100);
+/// The output buffer the player models. Waking up to this late, it writes
+/// everything that fell due, as a DAC playing from its buffer would have:
+/// WAV writes on a busy ext4 disk were measured blocking 26 to 180 ms.
+/// Further behind, as after the process was stopped, it skips to now in
+/// one silent write.
+const MAX_BEHIND: Duration = Duration::from_millis(500);
 /// How often to look for a clock estimate while chunks wait for one.
 const NO_CLOCK_POLL: Duration = Duration::from_millis(10);
 /// Ten seconds of 10 ms chunks: only reached while no clock estimate lets
@@ -680,6 +683,36 @@ mod tests {
         rig.player.step(ms(110));
         assert_eq!(rig.samples(), [2_000; 2 * FRAMES]);
         assert_eq!(rig.timing(), "0 110000\n");
+    }
+
+    #[test]
+    fn waking_late_within_the_buffer_writes_everything_that_fell_due() {
+        let mut rig = rig("short-stall");
+        for seq in 0..31 {
+            rig.player.apply(chunk(seq, 100 + seq * 10, 1_000));
+        }
+        rig.player.step(ms(100));
+        assert_eq!(rig.player.step(ms(400)), Some(ms(410)));
+
+        assert_eq!(rig.samples(), vec![1_000; 31 * 2 * FRAMES]);
+        assert_eq!(rig.counter(|c| &c.underruns), 0);
+        assert_eq!(rig.counter(|c| &c.late_chunks), 0);
+    }
+
+    #[test]
+    fn waking_later_than_the_buffer_skips_to_now_in_silence() {
+        let mut rig = rig("long-stall");
+        for seq in 0..=200 {
+            rig.player.apply(chunk(seq, 100 + seq * 10, 1_000));
+        }
+        rig.player.step(ms(100));
+        assert_eq!(rig.player.step(ms(2_000)), Some(ms(2_010)));
+
+        let timing = rig.timing();
+        assert_eq!(timing.lines().last(), Some("91200 2000000"));
+        assert_eq!(timing.lines().count(), 2);
+        assert_eq!(rig.counter(|c| &c.late_chunks), 189);
+        assert_eq!(rig.counter(|c| &c.underruns), 1);
     }
 
     #[test]

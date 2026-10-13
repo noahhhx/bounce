@@ -35,7 +35,8 @@ change.
   one `AdminRequest` as serde's externally tagged JSON, such as
   `{"RouteZone":{"zone":1,"source":0}}`, and returns 202.
 - WAV sink: `stream-<id>.wav` (16-bit PCM, 44-byte header) next to
-  `stream-<id>.timing` (`<first frame> <play_at us>` per chunk).
+  `stream-<id>.timing` (`<first frame> <play_at us> <wall us>` per chunk,
+  where `wall us` is when that frame plays on the host wall clock).
 
 **Current status (2026-10-13).** `$B up --clients 2` gives a healthy
 doctor. Clients connect, converge on their desired state, stay online, and
@@ -134,8 +135,10 @@ $B sync                                                                  # click
 ```
 
 `sync` finds the test tone's once-a-second click in every client's WAV and
-converts each click to server-clock time using the `.timing` file. It
-prints `second <s> clients=<n> spread_us=<µs>` and writes `clicks.txt` and
+groups the clicks by server-clock second using the `.timing` file. The
+spread is measured on the host wall clock, which every local process
+shares, so it includes each client's own clock-offset error. It prints
+`second <s> clients=<n> spread_us=<µs>` and writes `clicks.txt` and
 `sync.txt` to evidence.
 
 Per-feature recipes are in [features/README.md](features/README.md).

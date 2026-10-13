@@ -198,7 +198,7 @@ clicks() {
   od -An -v -t d2 -w2 -j 44 "$wav" | awk -v ch="$channels" -v rate="$rate" -v peak="$peak" -v timing="$timing" '
     BEGIN {
       n = 0
-      while ((getline l < timing) > 0) { split(l, f, " "); tf[n] = f[1]; tp[n] = f[2]; n++ }
+      while ((getline l < timing) > 0) { split(l, f, " "); tf[n] = f[1]; tp[n] = f[2]; tw[n] = f[3]; n++ }
       threshold = peak / 2; min_gap = rate / 2
       last = -rate; k = -1
     }
@@ -208,7 +208,10 @@ clicks() {
       if (v > threshold && frame - last > min_gap) {
         last = frame
         while (k + 1 < n && tf[k + 1] <= frame) k++
-        if (k >= 0) printf "%d %d\n", frame, tp[k] + (frame - tf[k]) * 1000000 / rate
+        if (k >= 0) {
+          offset = (frame - tf[k]) * 1000000 / rate
+          printf "%d %d %d\n", frame, tp[k] + offset, tw[k] + offset
+        }
       }
     }'
 }
@@ -226,9 +229,9 @@ cmd_sync() {
   mapfile -t wavs < <(find "$RUN/evidence/wav" -name 'stream-*.wav' | sort)
   ((${#wavs[@]} >= 2)) || die "sync needs WAVs from at least two clients; found ${#wavs[@]}"
   for w in "${wavs[@]}"; do
-    clicks "$w" | awk -v name="${w#"$RUN"/evidence/wav/}" '{ print name, $1, $2 }'
+    clicks "$w" | awk -v name="${w#"$RUN"/evidence/wav/}" '{ print name, $1, $2, $3 }'
   done | tee "$RUN/evidence/clicks.txt" | awk '
-    { sec = int(($3 + 500000) / 1000000); t[sec] = t[sec] " " $3; c[sec]++ }
+    { sec = int(($3 + 500000) / 1000000); t[sec] = t[sec] " " $4; c[sec]++ }
     END {
       for (sec in t) {
         split(substr(t[sec], 2), v, " "); lo = v[1]; hi = v[1]

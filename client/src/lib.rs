@@ -231,7 +231,10 @@ mod tests {
     fn reports_buffering_then_playing_for_the_desired_stream_then_idle() {
         let dir = std::env::temp_dir().join(format!("bounce-device-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut device = Device::new(Output::Wav(WavOutput { dir: dir.clone() }));
+        let mut device = Device::new(Output::Wav(WavOutput {
+            dir: dir.clone(),
+            wall_origin_us: 0,
+        }));
         let now = clock::now();
         let server_now = ServerInstant(u64::try_from(now.0.as_micros()).unwrap());
         device.on_message(

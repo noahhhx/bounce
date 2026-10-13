@@ -4,17 +4,32 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bounce_common::protocol::{TimeSyncReply, TimeSyncRequest};
 use bounce_common::time::{ClockOffset, ServerInstant, SinceBoot};
 
-static ORIGIN: OnceLock<Instant> = OnceLock::new();
+static ORIGIN: OnceLock<(Instant, SystemTime)> = OnceLock::new();
+
+fn origin() -> &'static (Instant, SystemTime) {
+    ORIGIN.get_or_init(|| (Instant::now(), SystemTime::now()))
+}
 
 /// Time since the first call in this process.
 #[must_use]
 pub fn now() -> SinceBoot {
-    SinceBoot(ORIGIN.get_or_init(Instant::now).elapsed())
+    SinceBoot(origin().0.elapsed())
+}
+
+/// The host wall clock at [`now`]'s zero, in microseconds since the Unix
+/// epoch. Only the WAV sink uses it: processes on one machine share the
+/// wall clock, so it can check their sync without trusting their offset
+/// estimates. On a Pi before NTP it is wrong, which is why nothing else
+/// uses it.
+#[must_use]
+pub fn wall_origin_micros() -> u64 {
+    let since_epoch = origin().1.duration_since(UNIX_EPOCH).unwrap_or_default();
+    u64::try_from(since_epoch.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Default)]

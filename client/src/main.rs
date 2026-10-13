@@ -45,7 +45,10 @@ fn main() -> ExitCode {
     info!(client = ?hello.client, boot = hello.boot.0, %server, "starting");
     let output = match config.output {
         OutputBackend::Alsa => Output::Alsa,
-        OutputBackend::Wav { dir } => Output::Wav(WavOutput { dir }),
+        OutputBackend::Wav { dir } => Output::Wav(WavOutput {
+            dir,
+            wall_origin_us: clock::wall_origin_micros(),
+        }),
     };
     Link::new(Tcp, server, Backoff::default(), hello, Device::new(output)).run()
 }

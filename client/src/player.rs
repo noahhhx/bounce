@@ -110,10 +110,13 @@ pub enum Output {
 /// Each stream gets `<dir>/stream-<id>.wav`, 16-bit PCM behind the canonical
 /// 44-byte header (sizes rewritten after every write, so the file is
 /// readable while the client runs), and `<dir>/stream-<id>.timing`, one
-/// `<first frame> <play_at us>` line per chunk written. Starting a stream
-/// whose files exist appends to them.
+/// `<first frame> <play_at us> <wall us>` line per chunk written, where
+/// `wall us` is when that frame reaches the listener on the host wall clock.
+/// Starting a stream whose files exist appends to them.
 pub struct WavOutput {
     pub dir: PathBuf,
+    /// From [`crate::clock::wall_origin_micros`].
+    pub wall_origin_us: u64,
 }
 
 struct WavStream {
@@ -121,6 +124,7 @@ struct WavStream {
     timing: File,
     frames: u64,
     block_align: u16,
+    wall_origin_us: u64,
 }
 
 /// How far a chunk's deadline may sit from where the output is up to and
@@ -346,7 +350,8 @@ impl Player {
                 Some(d) if after(d, TOLERANCE) < *cursor => self.drop_late(),
                 Some(d) if d <= after(*cursor, TOLERANCE) => {
                     let chunk = self.buffer.pop_front().expect("deadline came from a chunk");
-                    let frames = track.wav.chunk(&chunk, gain)?;
+                    let heard = after(*cursor, self.settings.latency);
+                    let frames = track.wav.chunk(&chunk, gain, heard)?;
                     *cursor = after(*cursor, duration_of(frames, rate));
                 }
                 gap => {
@@ -460,6 +465,7 @@ impl WavOutput {
             timing,
             frames: data_len / u64::from(block_align),
             block_align,
+            wall_origin_us: self.wall_origin_us,
         };
         stream.wav.set_len(HEADER_LEN + stream.data_len())?;
         stream.write_header(format)?;
@@ -469,7 +475,7 @@ impl WavOutput {
 
 impl WavStream {
     /// Returns the frames written.
-    fn chunk(&mut self, chunk: &AudioChunk, gain: i32) -> io::Result<u64> {
+    fn chunk(&mut self, chunk: &AudioChunk, gain: i32, heard: SinceBoot) -> io::Result<u64> {
         let first = self.frames;
         let pcm: Vec<u8> = chunk
             .data
@@ -479,7 +485,8 @@ impl WavStream {
             .flat_map(|&s| scale(i16::from_le_bytes(s), gain).to_le_bytes())
             .collect();
         let frames = self.append(&pcm)?;
-        writeln!(self.timing, "{first} {}", chunk.play_at.0)?;
+        let wall = self.wall_origin_us + u64::try_from(heard.0.as_micros()).unwrap_or(u64::MAX);
+        writeln!(self.timing, "{first} {} {wall}", chunk.play_at.0)?;
         Ok(frames)
     }
 
@@ -578,7 +585,10 @@ mod tests {
         let (changes_tx, changes) = mpsc::channel();
         let mut player = Player::new(
             clock,
-            Output::Wav(WavOutput { dir: dir.clone() }),
+            Output::Wav(WavOutput {
+                dir: dir.clone(),
+                wall_origin_us: 0,
+            }),
             Arc::default(),
             changes_tx,
         );
@@ -658,8 +668,24 @@ mod tests {
 
         assert_eq!(rig.player.step(ms(100)), Some(ms(110)));
         assert_eq!(rig.samples(), [1_000; 2 * FRAMES]);
-        assert_eq!(rig.timing(), "0 100000\n");
+        assert_eq!(rig.timing(), "0 100000 100000\n");
         assert_eq!(rig.states(), [PlayerState::Playing { stream: STREAM }]);
+    }
+
+    #[test]
+    fn timing_records_when_each_chunk_plays_on_the_wall_clock() {
+        let mut rig = rig("heard");
+        rig.player.clock.set(Some(ClockOffset(5_000)));
+        rig.player.apply(chunk(0, 100, 1_000));
+        let PlayerInput::Chunk(mut off) = chunk(1, 110, 2_000) else {
+            unreachable!()
+        };
+        off.play_at = ServerInstant(110_600);
+        rig.player.apply(PlayerInput::Chunk(off));
+
+        rig.player.step(ms(95));
+        rig.player.step(ms(105));
+        assert_eq!(rig.timing(), "0 100000 95000\n480 110600 105000\n");
     }
 
     #[test]
@@ -682,7 +708,7 @@ mod tests {
         assert_eq!(rig.counter(|c| &c.late_chunks), 1);
         rig.player.step(ms(110));
         assert_eq!(rig.samples(), [2_000; 2 * FRAMES]);
-        assert_eq!(rig.timing(), "0 110000\n");
+        assert_eq!(rig.timing(), "0 110000 110000\n");
     }
 
     #[test]
@@ -709,7 +735,7 @@ mod tests {
         assert_eq!(rig.player.step(ms(2_000)), Some(ms(2_010)));
 
         let timing = rig.timing();
-        assert_eq!(timing.lines().last(), Some("91200 2000000"));
+        assert_eq!(timing.lines().last(), Some("91200 2000000 2000000"));
         assert_eq!(timing.lines().count(), 2);
         assert_eq!(rig.counter(|c| &c.late_chunks), 189);
         assert_eq!(rig.counter(|c| &c.underruns), 1);
@@ -741,7 +767,7 @@ mod tests {
             rig.player.step(ms(at));
         }
 
-        assert_eq!(rig.timing(), "0 100000\n1440 130000\n");
+        assert_eq!(rig.timing(), "0 100000 100000\n1440 130000 130000\n");
         let samples = rig.samples();
         assert_eq!(samples.len(), 2 * 4 * FRAMES);
         assert!(samples[2 * FRAMES..2 * 3 * FRAMES].iter().all(|&s| s == 0));
@@ -818,7 +844,7 @@ mod tests {
         rig.player.apply(chunk(50, 600, 2));
         rig.player.step(ms(600));
 
-        assert_eq!(rig.timing(), "0 100000\n480 600000\n");
+        assert_eq!(rig.timing(), "0 100000 100000\n480 600000 600000\n");
         assert_eq!(rig.samples().len(), 2 * 2 * FRAMES);
         assert_eq!(
             rig.states(),

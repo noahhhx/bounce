@@ -66,6 +66,21 @@ pub struct Thresholds {
     pub converge_timeout: Duration,
 }
 
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            heartbeat_timeout: Duration::from_secs(15),
+            offline_grace: Duration::from_mins(2),
+            max_soc_millicelsius: 80_000,
+            min_wifi_rssi_dbm: -75,
+            max_underruns_per_minute: 1.0,
+            max_clock_jitter: Duration::from_millis(5),
+            crash_memory: Duration::from_hours(1),
+            converge_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 type Rule = fn(&ClientRecord, &Thresholds, Instant) -> Option<Problem>;
 
 /// Adding a check means adding a function here. Nothing else changes.

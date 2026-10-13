@@ -16,6 +16,14 @@ pub struct ReleaseCatalog {
 }
 
 impl ReleaseCatalog {
+    #[must_use]
+    pub fn new(artifact_dir: PathBuf) -> Self {
+        Self {
+            releases: HashMap::new(),
+            artifact_dir,
+        }
+    }
+
     /// Copies the artifact into `artifact_dir` and checks its hash before
     /// the release becomes visible, so no client is ever offered a build
     /// the server can't serve.
@@ -31,7 +39,12 @@ impl ReleaseCatalog {
     /// client's target. Skips the client's bad releases in both cases.
     #[must_use]
     pub fn release_for(&self, client: &ClientRecord) -> Option<&Release> {
-        todo!()
+        let releases = self.releases.get(&client.hello.target)?;
+        let usable = |release: &&Release| !client.bad_releases.contains(&release.version);
+        match client.release_pin {
+            Some(pin) => releases.get(&pin).filter(usable),
+            None => releases.values().rev().find(usable),
+        }
     }
 }
 

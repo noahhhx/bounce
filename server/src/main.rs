@@ -1,20 +1,24 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::watch;
 
 use bounce_common::ids::SourceId;
 use bounce_server::broadcast::Broadcaster;
 use bounce_server::clock;
 use bounce_server::config::{Config, READY_PREFIX};
-use bounce_server::hub::HubEvent;
+use bounce_server::health::Thresholds;
+use bounce_server::hub::{Effect, Hub, HubEvent};
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
 use bounce_server::source::{Pcm, Source, SourceConfig, SourceOutput};
+use bounce_server::updates::ReleaseCatalog;
 
 /// Snapcast's default.
 const PLAYOUT_DELAY: Duration = Duration::from_secs(1);
@@ -40,7 +44,7 @@ async fn main() {
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let streams = Arc::new(AtomicU64::new(unix_micros()));
-    let mut sources: Vec<Box<dyn Source>> = Vec::new();
+    let mut sources: HashMap<SourceId, Box<dyn Source>> = HashMap::new();
     for (id, source_config) in (0..).zip(config.sources) {
         let id = SourceId(id);
         let (pcm_tx, pcm_rx) = mpsc::unbounded_channel();
@@ -55,18 +59,44 @@ async fn main() {
             pcm_tx,
             streams.clone(),
         ));
-        sources.push(source);
+        sources.insert(id, source);
     }
 
+    let mut hub = Hub::new(
+        sources
+            .iter()
+            .map(|(&id, source)| (id, source.kind(), source.name().to_owned())),
+        ReleaseCatalog::new(config.data_dir.join("releases")),
+        Thresholds::default(),
+    );
+    let (state, _) = watch::channel(hub.view());
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
-        tokio::select! {
+        let event = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            Some(HubEvent::Source { source, event }) = events.recv() => {
-                info!("source {}: {event:?}", source.0);
+            _ = tick.tick() => HubEvent::Tick,
+            Some(event) = events.recv() => event,
+        };
+        for effect in hub.handle(event, Instant::now()) {
+            match effect {
+                Effect::StateChanged(view) => {
+                    state.send_replace(view);
+                }
+                Effect::ControlSource { source, control } => {
+                    if let Some(source) = sources.get_mut(&source) {
+                        source.control(control);
+                    }
+                }
+                Effect::Send { .. }
+                | Effect::Close { .. }
+                | Effect::Subscribe { .. }
+                | Effect::Unsubscribe { .. } => debug!("no session to apply {effect:?}"),
+                Effect::AlertRaised(alert) => info!("alert raised: {alert:?}"),
+                Effect::AlertCleared(key) => info!("alert cleared: {key:?}"),
             }
         }
     }
-    let stopping: Vec<_> = sources.iter_mut().filter_map(|s| s.stop()).collect();
+    let stopping: Vec<_> = sources.values_mut().filter_map(|s| s.stop()).collect();
     let all_stopped = async {
         for task in stopping {
             let _ = task.await;

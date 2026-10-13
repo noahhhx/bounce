@@ -87,7 +87,7 @@ pub enum RejectReason {
 /// Everything the server wants a client to be doing. Zones do not appear:
 /// the server resolves zone membership and zone volume into the fields
 /// below, so the client never needs to know zones exist.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesiredState {
     pub revision: Revision,
     pub name: String,
@@ -109,7 +109,7 @@ pub struct DesiredState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Revision(pub u64);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Playback {
     Idle,
     Playing {

@@ -2,7 +2,7 @@
 //! off when the server restarts still shows as offline instead of vanishing.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use bounce_common::ids::{BootId, ClientId, Version, ZoneId};
@@ -11,6 +11,7 @@ use bounce_common::telemetry::{Fault, Level, MetricsSample};
 use bounce_common::zone::Volume;
 
 use crate::session::SessionId;
+use crate::snapshot::SavedClient;
 
 #[derive(Default)]
 pub struct Fleet {
@@ -63,6 +64,51 @@ pub enum OfflineCause {
 }
 
 impl Fleet {
+    /// Every restored client starts offline until it connects again.
+    #[must_use]
+    pub fn restore(saved: BTreeMap<ClientId, SavedClient>, now: Instant) -> Self {
+        let clients = saved
+            .into_iter()
+            .map(|(id, saved)| {
+                let record = ClientRecord {
+                    hello: saved.hello,
+                    name: saved.name,
+                    liveness: Liveness::Offline {
+                        since: now,
+                        cause: OfflineCause::NotSeenSinceServerStart,
+                    },
+                    zone: saved.zone,
+                    desired: saved.desired,
+                    reported: None,
+                    metrics: VecDeque::new(),
+                    faults: VecDeque::new(),
+                    release_pin: saved.release_pin,
+                    bad_releases: saved.bad_releases,
+                };
+                (id, record)
+            })
+            .collect();
+        Self { clients }
+    }
+
+    #[must_use]
+    pub fn saved(&self) -> BTreeMap<ClientId, SavedClient> {
+        self.clients
+            .iter()
+            .map(|(id, record)| {
+                let saved = SavedClient {
+                    hello: record.hello.clone(),
+                    name: record.name.clone(),
+                    zone: record.zone,
+                    desired: record.desired.clone(),
+                    release_pin: record.release_pin,
+                    bad_releases: record.bad_releases.clone(),
+                };
+                (id.clone(), saved)
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn get(&self, id: &ClientId) -> Option<&ClientRecord> {
         self.clients.get(id)

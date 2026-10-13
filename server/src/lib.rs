@@ -27,6 +27,7 @@ pub mod health;
 pub mod http;
 pub mod hub;
 pub mod session;
+pub mod snapshot;
 pub mod source;
 pub mod telemetry;
 pub mod transport;

@@ -55,7 +55,7 @@ pub enum ServerMessage {
     Command(Command),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol: u16,
     pub client: ClientId,
@@ -67,7 +67,7 @@ pub struct Hello {
     pub codecs: Vec<Codec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputDevice {
     /// ALSA device string, e.g. `hw:CARD=sndrpihifiberry`.
     pub id: String,

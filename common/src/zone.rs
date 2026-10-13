@@ -7,7 +7,7 @@ use crate::ids::{ClientId, SourceId, ZoneId};
 /// A set of clients with one volume and one source. A client is in at most
 /// one zone; the server's zone table enforces that, not this type. Zones
 /// routed to the same source play in sync with each other.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Zone {
     pub id: ZoneId,
     pub name: String,

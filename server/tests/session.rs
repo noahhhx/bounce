@@ -32,6 +32,7 @@ impl Drop for Server {
 
 fn start_server() -> Server {
     let data_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("session-test");
+    let _ = std::fs::remove_dir_all(&data_dir);
     let mut child = Command::new(env!("CARGO_BIN_EXE_bounce-server"))
         .args([
             "--listen",

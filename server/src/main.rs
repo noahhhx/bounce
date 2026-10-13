@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -18,6 +19,7 @@ use bounce_server::health::Thresholds;
 use bounce_server::http;
 use bounce_server::hub::{Effect, Hub, HubEvent};
 use bounce_server::session::{self, AudioLane, Outbox, SessionEvent, SessionId};
+use bounce_server::snapshot::{self, Snapshot};
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
 use bounce_server::source::{Pcm, Source, SourceConfig, SourceOutput};
@@ -105,6 +107,8 @@ async fn main() {
         }
     };
 
+    let fleet_path = config.data_dir.join("fleet.json");
+    let saved = load_fleet(&config.data_dir, &fleet_path);
     let session_listener = bind("--listen", config.listen).await;
     let http_listener = bind("--http", config.http).await;
     println!(
@@ -143,6 +147,8 @@ async fn main() {
             .map(|(&id, source)| (id, source.kind(), source.name().to_owned())),
         ReleaseCatalog::new(releases.clone()),
         Thresholds::default(),
+        saved,
+        Instant::now(),
     );
     let (state, state_rx) = watch::channel(hub.view());
     let api = http::serve(http_listener, events_tx.clone(), state_rx, releases);
@@ -180,9 +186,18 @@ async fn main() {
                 Effect::Unsubscribe { source, client } => routing.unsubscribe(source, client),
                 Effect::AlertRaised(alert) => info!("alert raised: {alert:?}"),
                 Effect::AlertCleared(key) => info!("alert cleared: {key:?}"),
+                Effect::Persist(snapshot) => {
+                    if let Err(error) = snapshot::save(&fleet_path, &snapshot) {
+                        error!("saving {}: {error}", fleet_path.display());
+                    }
+                }
             }
         }
     }
+    stop(sources).await;
+}
+
+async fn stop(mut sources: HashMap<SourceId, Box<dyn Source>>) {
     let stopping: Vec<_> = sources.values_mut().filter_map(|s| s.stop()).collect();
     let all_stopped = async {
         for task in stopping {
@@ -219,6 +234,19 @@ async fn broadcast(
             },
         }
     }
+}
+
+/// Exits rather than starting empty, because the first save would then
+/// overwrite a fleet that is still on disk.
+fn load_fleet(data_dir: &Path, path: &Path) -> Snapshot {
+    if let Err(error) = std::fs::create_dir_all(data_dir) {
+        eprintln!("bounce-server: {}: {error}", data_dir.display());
+        std::process::exit(1);
+    }
+    snapshot::load(path).unwrap_or_else(|error| {
+        eprintln!("bounce-server: {}: {error}", path.display());
+        std::process::exit(1);
+    })
 }
 
 fn unix_micros() -> u64 {

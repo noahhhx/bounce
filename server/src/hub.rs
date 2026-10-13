@@ -22,6 +22,7 @@ use crate::fleet::{ClientRecord, Fleet, Liveness, OfflineCause};
 use crate::health::{Alert, AlertKey, Thresholds};
 use crate::http::{ClientView, SourceView, StateView};
 use crate::session::SessionId;
+use crate::snapshot::Snapshot;
 use crate::source::{SourceControl, SourceEvent, SourceKind, TrackMetadata};
 use crate::updates::ReleaseCatalog;
 
@@ -35,6 +36,9 @@ pub struct Hub {
     /// What has been emitted as [`Effect::Subscribe`], so reconciling can
     /// emit only the difference.
     subscriptions: HashMap<ClientId, SourceId>,
+    /// The last snapshot loaded or emitted as [`Effect::Persist`], so only a
+    /// durable change is written.
+    persisted: Snapshot,
 }
 
 /// What the hub knows about a running source. The [`crate::source::Source`]
@@ -144,17 +148,21 @@ pub enum Effect {
     },
     AlertRaised(Alert),
     AlertCleared(AlertKey),
+    /// Durable state changed. Written to disk so it outlives a restart.
+    Persist(Snapshot),
     /// For [`crate::http`] to serve as `/api/state`.
     StateChanged(StateView),
 }
 
 impl Hub {
-    /// Sources start idle at full volume.
+    /// Sources start idle at full volume. Clients in `saved` start offline.
     #[must_use]
     pub fn new(
         sources: impl IntoIterator<Item = (SourceId, SourceKind, String)>,
         catalog: ReleaseCatalog,
         thresholds: Thresholds,
+        saved: Snapshot,
+        now: Instant,
     ) -> Self {
         let sources = sources
             .into_iter()
@@ -170,22 +178,29 @@ impl Hub {
             })
             .collect();
         Self {
-            fleet: Fleet::default(),
-            zones: HashMap::new(),
+            fleet: Fleet::restore(saved.clients.clone(), now),
+            zones: saved.zones.clone().into_iter().collect(),
             sources,
             catalog,
             thresholds,
             alerts: HashMap::new(),
             subscriptions: HashMap::new(),
+            persisted: saved,
         }
     }
 
     /// Applies the event, then reconciles everything derived from state.
-    /// Always ends with [`Effect::StateChanged`].
+    /// Always ends with [`Effect::StateChanged`], preceded by
+    /// [`Effect::Persist`] when durable state changed.
     pub fn handle(&mut self, event: HubEvent, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         let connected = self.apply(event, now, &mut effects);
         self.reconcile(connected.as_ref(), &mut effects);
+        let snapshot = self.snapshot();
+        if snapshot != self.persisted {
+            self.persisted = snapshot.clone();
+            effects.push(Effect::Persist(snapshot));
+        }
         effects.push(Effect::StateChanged(self.view()));
         effects
     }
@@ -429,6 +444,13 @@ impl Hub {
         self.subscriptions = target;
     }
 
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            clients: self.fleet.saved(),
+            zones: self.zones.iter().map(|(&id, z)| (id, z.clone())).collect(),
+        }
+    }
+
     /// Clients, zones and sources, each sorted by id.
     #[must_use]
     pub fn view(&self) -> StateView {
@@ -541,10 +563,16 @@ mod tests {
     };
 
     fn hub() -> Hub {
+        restored(Snapshot::default())
+    }
+
+    fn restored(saved: Snapshot) -> Hub {
         Hub::new(
             [(TONE, SourceKind::TestTone, "Tone".to_owned())],
             ReleaseCatalog::new(PathBuf::new()),
             Thresholds::default(),
+            saved,
+            Instant::now(),
         )
     }
 
@@ -653,6 +681,52 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn persisted(effects: &[Effect]) -> Option<Snapshot> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Persist(snapshot) => Some(snapshot.clone()),
+            _ => None,
+        })
+    }
+
+    /// Client 1 renamed into a kitchen routed to the tone at volume 30, then
+    /// disconnected. Returns the hub and the last snapshot it emitted.
+    fn kitchen_then_gone(t0: Instant) -> (Hub, Snapshot) {
+        let mut hub = hub();
+        let mut events = vec![connected(1, 1)];
+        events.extend(
+            [
+                AdminRequest::UpsertZone {
+                    zone: KITCHEN,
+                    name: "Kitchen".to_owned(),
+                },
+                AdminRequest::MoveClient {
+                    client: client(1),
+                    zone: Some(KITCHEN),
+                },
+                AdminRequest::RouteZone {
+                    zone: KITCHEN,
+                    source: Some(TONE),
+                },
+                AdminRequest::SetZoneVolume {
+                    zone: KITCHEN,
+                    volume: Volume::new(30),
+                },
+                AdminRequest::RenameClient {
+                    client: client(1),
+                    name: "Kitchen left".to_owned(),
+                },
+            ]
+            .map(HubEvent::Admin),
+        );
+        events.push(disconnected(1, 1));
+        let saved = events
+            .into_iter()
+            .filter_map(|event| persisted(&hub.handle(event, t0)))
+            .last()
+            .expect("the hub persisted something");
+        (hub, saved)
     }
 
     fn members(hub: &Hub) -> Vec<(ZoneId, Vec<ClientId>)> {
@@ -927,5 +1001,65 @@ mod tests {
             );
             assert_eq!(format!("{:?}", hub.view()), before, "{label}");
         }
+    }
+
+    #[test]
+    fn a_client_offline_across_a_restart_is_listed_with_its_zone_and_name() {
+        let t0 = Instant::now();
+        let (before, saved) = kitchen_then_gone(t0);
+        let mut restarted = restored(saved);
+        restarted.handle(HubEvent::Tick, secs(t0, 1));
+        let after = restarted.view();
+        assert_eq!(after.clients.len(), 1);
+        let restored = &after.clients[0];
+        assert_eq!(restored.id, client(1));
+        assert!(!restored.online);
+        assert_eq!(restored.zone, Some(KITCHEN));
+        assert_eq!(restored.desired, before.view().clients[0].desired);
+        assert_eq!(restored.desired.name, "Kitchen left");
+    }
+
+    #[test]
+    fn zones_survive_a_restart() {
+        let (before, saved) = kitchen_then_gone(Instant::now());
+        let zones = restored(saved).view().zones;
+        assert_eq!(zones, before.view().zones);
+        assert_eq!(zones[0].name, "Kitchen");
+        assert_eq!(zones[0].source, Some(TONE));
+        assert_eq!(zones[0].volume, Volume::new(30));
+        assert_eq!(members(&before), [(KITCHEN, vec![client(1)])]);
+    }
+
+    #[test]
+    fn a_tick_that_changes_nothing_durable_persists_nothing() {
+        let t0 = Instant::now();
+        let (mut live, _) = routed(t0);
+        let (_, saved) = kitchen_then_gone(t0);
+        let mut restarted = restored(saved);
+        for (label, hub) in [("live", &mut live), ("restarted", &mut restarted)] {
+            assert_eq!(persisted(&hub.handle(HubEvent::Tick, t0)), None, "{label}");
+        }
+        let timed_out = live.handle(HubEvent::Tick, secs(t0, 60));
+        assert!(!live.view().clients[0].online);
+        assert_eq!(persisted(&timed_out), None, "liveness is not durable");
+    }
+
+    #[test]
+    fn a_restored_client_reconnects_into_its_zone_without_a_new_revision() {
+        let t0 = Instant::now();
+        let (_, saved) = kitchen_then_gone(t0);
+        let revision = saved.clients[&client(1)].desired.revision;
+        let mut hub = restored(saved);
+
+        let effects = hub.handle(connected(1, 7), secs(t0, 1));
+        let view = hub.view();
+        assert!(view.clients[0].online);
+        assert_eq!(view.clients[0].zone, Some(KITCHEN));
+        assert_eq!(members(&hub), [(KITCHEN, vec![client(1)])]);
+        assert_eq!(desired(&effects)[0].1.revision, revision);
+        assert_eq!(subscription_changes(&effects), [(true, TONE, client(1))]);
+
+        let playing = desired(&start_tone(&mut hub, secs(t0, 2)));
+        assert_eq!(playing[0].1.revision, Revision(revision.0 + 1));
     }
 }

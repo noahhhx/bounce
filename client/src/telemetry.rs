@@ -30,19 +30,14 @@ pub struct LogBuffer {
     level: Level,
 }
 
-/// Holds a long server outage of the client's own logging, at a few
-/// hundred bytes a record.
 pub const LOG_CAPACITY: usize = 4096;
 
 impl LogBuffer {
-    /// Buffers `Info` and above until the desired state says otherwise.
     #[must_use]
     pub fn new(boot: BootId, capacity: usize) -> Self {
         Self {
             boot,
             records: VecDeque::new(),
-            // Starts at 1 so that the server's answer to an empty batch,
-            // `LogSeq(0)`, acks nothing.
             next_seq: LogSeq(1),
             capacity,
             dropped: 0,
@@ -91,7 +86,6 @@ impl LogBuffer {
         })
     }
 
-    /// An ack for another boot is for records this process never had.
     pub fn ack(&mut self, boot: BootId, up_to: LogSeq) {
         if boot != self.boot {
             return;
@@ -113,26 +107,16 @@ impl LogBuffer {
     }
 }
 
-/// Recovers a poisoned lock instead of panicking, because the
-/// [`ForwardLayer`] takes it inside every log call, the audio thread's
-/// included.
 pub fn lock(buffer: &Mutex<LogBuffer>) -> MutexGuard<'_, LogBuffer> {
     buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A `tracing_subscriber::Layer` that formats each event into a
-/// [`LogRecord`] and pushes it into the shared buffer. Installed alongside
-/// the stderr layer, so local logs keep working.
-///
-/// It formats before taking the lock and holds it only to append, so a
-/// thread that logs waits at most for one append or one
-/// [`LogBuffer::batch`] copy.
+/// [`LogRecord`] and pushes it into the shared buffer.
 pub struct ForwardLayer {
     buffer: Arc<Mutex<LogBuffer>>,
 }
 
-/// Per message and per field value. Keeps a batch under the wire's frame
-/// limit, since a batch too big to send would fail every reconnect.
 const MAX_TEXT: usize = 1024;
 
 impl ForwardLayer {

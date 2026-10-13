@@ -193,7 +193,6 @@ async fn main() {
     }
 }
 
-/// Starts each source with its own broadcaster, registered in `routing`.
 fn start_sources(
     configs: Vec<SourceConfig>,
     events: &UnboundedSender<HubEvent>,
@@ -280,8 +279,6 @@ async fn broadcast(
     }
 }
 
-/// Exits rather than starting empty, because the first save would then
-/// overwrite a fleet that is still on disk.
 fn load_fleet(data_dir: &Path, path: &Path) -> Snapshot {
     if let Err(error) = std::fs::create_dir_all(data_dir) {
         eprintln!("bounce-server: {}: {error}", data_dir.display());

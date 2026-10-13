@@ -1,8 +1,3 @@
-//! The durable part of hub state, saved as JSON in the data dir so the
-//! fleet and zones outlive a server restart. Liveness, reported state,
-//! metrics, faults, alerts and subscriptions are rebuilt from live clients
-//! and are not saved.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -25,8 +20,6 @@ pub struct SavedClient {
     pub hello: Hello,
     pub name: Option<String>,
     pub zone: Option<ZoneId>,
-    /// Whole, so revisions keep increasing across restarts and a client
-    /// never sees one it already applied.
     pub desired: DesiredState,
     pub release_pin: Option<Version>,
     pub bad_releases: BTreeSet<Version>,
@@ -47,8 +40,6 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// A missing file is a server that has never saved anything.
-///
 /// # Errors
 ///
 /// When the file exists but cannot be read or parsed.
@@ -60,10 +51,6 @@ pub fn load(path: &Path) -> Result<Snapshot, LoadError> {
     }
 }
 
-/// Writes a sibling temp file and renames it over `path`, so a crash or
-/// power cut leaves either the old snapshot or the new one, never half of
-/// one.
-///
 /// # Errors
 ///
 /// On any write, sync or rename failure. `path` is then unchanged.

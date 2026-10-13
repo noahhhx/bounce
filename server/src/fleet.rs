@@ -64,7 +64,6 @@ pub enum OfflineCause {
 }
 
 impl Fleet {
-    /// Every restored client starts offline until it connects again.
     #[must_use]
     pub fn restore(saved: BTreeMap<ClientId, SavedClient>, now: Instant) -> Self {
         let clients = saved

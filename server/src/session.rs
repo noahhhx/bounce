@@ -179,8 +179,6 @@ impl<C: Connection> Session<C> {
         Ok((session, hello, outbox))
     }
 
-    /// Logs go to the telemetry task, never the hub, and are acked on this
-    /// connection once stored.
     async fn run(mut self, events: &mpsc::UnboundedSender<SessionEvent>, telemetry: &Telemetry) {
         let mut client_clock = None;
         let ended = loop {
@@ -256,8 +254,6 @@ impl<C: Connection> Session<C> {
     }
 }
 
-/// Before the client's first `TimeSync`, the best guess is that its newest
-/// record was logged just now.
 fn assume_sent_now(batch: &LogBatch) -> ClientClock {
     let newest = batch.records.last().map(|record| record.at);
     ClientClock {

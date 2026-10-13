@@ -21,11 +21,6 @@ pub fn now() -> SinceBoot {
     SinceBoot(origin().0.elapsed())
 }
 
-/// The host wall clock at [`now`]'s zero, in microseconds since the Unix
-/// epoch. Only the WAV sink uses it: processes on one machine share the
-/// wall clock, so it can check their sync without trusting their offset
-/// estimates. On a Pi before NTP it is wrong, which is why nothing else
-/// uses it.
 #[must_use]
 pub fn wall_origin_micros() -> u64 {
     let since_epoch = origin().1.duration_since(UNIX_EPOCH).unwrap_or_default();

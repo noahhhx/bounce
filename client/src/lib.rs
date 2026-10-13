@@ -2,10 +2,6 @@
 //!
 //! - The main thread runs the [`link::Link`] and the [`Device`]. It does
 //!   every non-audio thing.
-//! - The audio thread owns the [`player::Player`] and its output. It never
-//!   touches the network or blocks on a lock the main thread holds. It
-//!   reads the clock offset and writes playback counters through atomics,
-//!   and sends its state changes on a channel the main thread drains.
 //! - The `tracing` layer writes into the shared [`telemetry::LogBuffer`]
 //!   from whatever thread logged.
 
@@ -45,19 +41,15 @@ pub struct Device {
     clock: ClockSync,
     next_sync: SinceBoot,
     player: PlayerHandle,
-    /// As last reported.
     player_state: PlayerState,
-    /// Never logs while holding this lock: the logging layer takes it too.
     logs: Arc<Mutex<LogBuffer>>,
 }
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Records are truncated by the logging layer, so this many fit one frame.
 const MAX_LOG_BATCH: usize = 64;
 
 impl Device {
-    /// Spawns the audio thread, which writes to `output`.
     #[must_use]
     pub fn new(output: Output, logs: Arc<Mutex<LogBuffer>>) -> Self {
         let clock = ClockSync::default();
@@ -107,12 +99,6 @@ impl Device {
         }
     }
 
-    /// Reports the player's state if it changed, sends at most one
-    /// `TimeSync` per `SYNC_INTERVAL`, however often it is called, and sends
-    /// unacked logs after it so the server can date them.
-    ///
-    /// Nothing here logs. A record about sending logs would itself need
-    /// sending on the next tick, forever.
     pub fn tick(&mut self, now: SinceBoot) -> Vec<ClientMessage> {
         let mut out = Vec::new();
         if let Some(state) = self.player.state_change() {
@@ -130,8 +116,6 @@ impl Device {
         out
     }
 
-    /// Sends the whole desired output every time. The player ignores a
-    /// `Start` for the stream it already has, so resending is harmless.
     fn converge(&self, desired: &DesiredState) {
         self.player.send(PlayerInput::Configure(OutputSettings {
             device: desired.output.clone(),
@@ -310,7 +294,6 @@ mod tests {
         assert_eq!(syncs(device.tick(at(1600))), 1);
     }
 
-    /// Ticks until a report with `want` arrives, collecting the reports.
     fn tick_until(
         device: &mut Device,
         want: &PlayerState,

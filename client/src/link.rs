@@ -265,7 +265,6 @@ mod tests {
         listener
     }
 
-    /// Stands in for mDNS. Answers in order, then finds nothing.
     #[derive(Clone, Default)]
     struct Discovery(Arc<Mutex<VecDeque<io::Result<SocketAddr>>>>);
 

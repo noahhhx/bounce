@@ -12,14 +12,9 @@ pub struct Config {
     pub output: OutputBackend,
 }
 
-/// Where the link connects, looked up again on every connect so a server
-/// that moved is found again. See [`crate::transport::Resolver`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Server {
-    /// `--server <host:port>`.
     Fixed(SocketAddr),
-    /// The default, which browses mDNS for
-    /// [`MDNS_SERVICE`](bounce_common::protocol::MDNS_SERVICE).
     Discover,
 }
 

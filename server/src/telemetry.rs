@@ -1,9 +1,7 @@
 //! Client logs and metrics history, queryable from the web UI.
 //!
 //! Records arrive stamped with time since client boot, because the device's
-//! wall clock may be wrong. The store converts to wall time on receipt
-//! using the session's [`ClientClock`], keeping the original stamp so
-//! ordering within a boot is exact even if the conversion is off.
+//! wall clock may be wrong. The store converts to wall time on receipt.
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::RangeInclusive;
@@ -33,8 +31,6 @@ pub trait TelemetryStore: Send {
     fn metrics(&self, client: &ClientId, between: RangeInclusive<SystemTime>) -> Vec<StoredSample>;
 }
 
-/// One reading of the client's boot clock and the server's wall clock at
-/// the same moment, taken by the session from a `TimeSync` request.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientClock {
     pub since_boot: SinceBoot,
@@ -95,8 +91,6 @@ pub struct MemoryStore {
 #[derive(Default)]
 struct ClientLogs {
     records: VecDeque<StoredLog>,
-    /// Only the latest boot's: an older boot's process is gone and sends
-    /// nothing more.
     stored_up_to: Option<(BootId, LogSeq)>,
 }
 
@@ -174,10 +168,6 @@ impl TelemetryStore for MemoryStore {
     }
 }
 
-/// The handle to the one task that owns the [`TelemetryStore`]. Each call
-/// is a request on a channel and a reply on a oneshot, so the store has a
-/// single owner and no lock. Every method returns `None` once that task
-/// is gone.
 #[derive(Clone)]
 pub struct Telemetry(mpsc::UnboundedSender<Request>);
 
@@ -195,7 +185,6 @@ enum Request {
 }
 
 impl Telemetry {
-    /// Spawns the owning task on the current tokio runtime.
     pub fn spawn(mut store: impl TelemetryStore + 'static) -> Self {
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -218,7 +207,6 @@ impl Telemetry {
         Self(requests_tx)
     }
 
-    /// The sequence to ack back to the client.
     pub async fn append_logs(
         &self,
         client: ClientId,

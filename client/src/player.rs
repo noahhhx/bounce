@@ -1,5 +1,5 @@
 //! The audio thread: hold chunks until their deadline, then write them to
-//! the output. This is where sync is won or lost.
+//! the output.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -20,11 +20,6 @@ use bounce_common::zone::Volume;
 
 use crate::clock::{self, SharedOffset};
 
-/// The network thread's handle. Chunks are bounded, so if the audio thread
-/// stalls the network thread drops chunks instead of growing memory on a
-/// 512 MB device. The channel itself is unbounded and the bound is
-/// `queued`, so `Start`, `Stop` and `Configure` are never dropped and stay
-/// ordered with the chunks around them.
 pub struct PlayerHandle {
     tx: Sender<PlayerInput>,
     queued: Arc<AtomicUsize>,
@@ -32,7 +27,6 @@ pub struct PlayerHandle {
     counters: Arc<PlaybackCounters>,
 }
 
-/// Over two seconds of 10 ms chunks, more than a late joiner's replay.
 const MAX_QUEUED: usize = 256;
 
 pub enum PlayerInput {
@@ -56,19 +50,14 @@ pub struct OutputSettings {
 /// boot, matching [`bounce_common::telemetry::PlaybackMetrics`].
 #[derive(Default)]
 pub struct PlaybackCounters {
-    /// Periods of silence written while playing because no chunk was due.
     pub underruns: AtomicU64,
     pub late_chunks: AtomicU64,
-    /// Chunks the network thread dropped because the audio thread was
-    /// behind.
     pub dropped_chunks: AtomicU64,
     pub buffered_us: AtomicU64,
 }
 
 pub struct Player {
     state: State,
-    /// Chunks for the current stream in sequence order. They arrive in
-    /// order over the session, so this is a queue, not a reorder buffer.
     buffer: VecDeque<AudioChunk>,
     output: Output,
     settings: OutputSettings,
@@ -77,19 +66,11 @@ pub struct Player {
     changes: Sender<PlayerState>,
 }
 
-/// [`PlayerState`] plus what only some states have: the open stream once
-/// one is buffering, and where the output is up to once it plays.
 enum State {
     Idle,
     Buffering(Track),
-    Playing {
-        track: Track,
-        /// The local time the next frame written reaches the listener.
-        cursor: SinceBoot,
-    },
-    OutputUnavailable {
-        device: String,
-    },
+    Playing { track: Track, cursor: SinceBoot },
+    OutputUnavailable { device: String },
 }
 
 struct Track {
@@ -99,7 +80,6 @@ struct Track {
 }
 
 pub enum Output {
-    /// Not implemented. Starting a stream reports `OutputUnavailable`.
     Alsa,
     Wav(WavOutput),
 }
@@ -115,7 +95,6 @@ pub enum Output {
 /// Starting a stream whose files exist appends to them.
 pub struct WavOutput {
     pub dir: PathBuf,
-    /// From [`crate::clock::wall_origin_micros`].
     pub wall_origin_us: u64,
 }
 
@@ -127,24 +106,10 @@ struct WavStream {
     wall_origin_us: u64,
 }
 
-/// How far a chunk's deadline may sit from where the output is up to and
-/// still be written there. Without resampling, this is also the drift the
-/// player absorbs before it drops a chunk or pads a gap. The WAV sink is
-/// paced by the deadlines themselves and loopback has no clock drift, so
-/// resampling is left for a real DAC.
 const TOLERANCE: Duration = Duration::from_millis(1);
-/// Silence written at a time when the buffer is dry.
 const PERIOD: Duration = Duration::from_millis(10);
-/// The output buffer the player models. Waking up to this late, it writes
-/// everything that fell due, as a DAC playing from its buffer would have:
-/// WAV writes on a busy ext4 disk were measured blocking 26 to 180 ms.
-/// Further behind, as after the process was stopped, it skips to now in
-/// one silent write.
 const MAX_BEHIND: Duration = Duration::from_millis(500);
-/// How often to look for a clock estimate while chunks wait for one.
 const NO_CLOCK_POLL: Duration = Duration::from_millis(10);
-/// Ten seconds of 10 ms chunks: only reached while no clock estimate lets
-/// any of them be judged late.
 const MAX_BUFFERED: usize = 1_000;
 
 impl PlayerHandle {
@@ -184,7 +149,6 @@ impl PlayerHandle {
         }
     }
 
-    /// The newest state the player entered since the last call, if any.
     #[must_use]
     pub fn state_change(&self) -> Option<PlayerState> {
         self.states.try_iter().last()
@@ -279,8 +243,6 @@ impl Player {
         }
     }
 
-    /// Writes everything due by `now`, and returns when something next
-    /// falls due, or `None` when only an input can change anything.
     fn step(&mut self, now: SinceBoot) -> Option<SinceBoot> {
         let before = self.state.reported();
         let state = std::mem::replace(&mut self.state, State::Idle);
@@ -365,9 +327,6 @@ impl Player {
         Ok(())
     }
 
-    /// When the chunk's first frame must reach the output: its server
-    /// deadline on the local clock, early by the device's output latency.
-    /// `None` until the clock has an estimate.
     fn deadline(&self, chunk: &AudioChunk) -> Option<SinceBoot> {
         let at = self.clock.to_local(chunk.play_at)?;
         Some(SinceBoot(at.0.saturating_sub(self.settings.latency)))
@@ -474,7 +433,6 @@ impl WavOutput {
 }
 
 impl WavStream {
-    /// Returns the frames written.
     fn chunk(&mut self, chunk: &AudioChunk, gain: i32, heard: SinceBoot) -> io::Result<u64> {
         let first = self.frames;
         let pcm: Vec<u8> = chunk
@@ -537,7 +495,6 @@ fn size_field(data_len: u64) -> u32 {
         .min(u32::MAX - 36)
 }
 
-/// Linear amplitude: `gain` is a volume percent.
 fn scale(sample: i16, gain: i32) -> i16 {
     i16::try_from(i32::from(sample) * gain / 100).expect("gain is at most 100")
 }
@@ -567,7 +524,6 @@ mod tests {
         codec: Codec::PcmS16Le,
     };
     const STREAM: StreamId = StreamId(7);
-    /// 10 ms of stereo at 48 kHz.
     const FRAMES: usize = 480;
 
     struct Rig {
@@ -576,7 +532,6 @@ mod tests {
         dir: PathBuf,
     }
 
-    /// Local time equals server time, so `play_at` is the deadline.
     fn rig(name: &str) -> Rig {
         let dir = std::env::temp_dir().join(format!("bounce-player-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -634,7 +589,6 @@ mod tests {
             std::fs::read(self.dir.join("stream-7.wav")).unwrap()
         }
 
-        /// Samples after the header.
         fn samples(&self) -> Vec<i16> {
             self.wav()[44..]
                 .as_chunks::<2>()

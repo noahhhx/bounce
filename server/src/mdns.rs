@@ -1,14 +1,11 @@
-//! Advertises the session listener as [`MDNS_SERVICE`], so a client finds
-//! the server with no flags.
-
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bounce_common::protocol::MDNS_SERVICE;
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 
-/// Registers one instance named after this host. It is answered until the
-/// returned daemon shuts down, which also sends the goodbye.
+/// The instance is answered until the returned daemon shuts down, which
+/// also sends the goodbye.
 ///
 /// # Errors
 ///

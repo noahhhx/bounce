@@ -66,8 +66,7 @@ pub struct LogView {
     /// Hex, since a JSON number loses the low bits of a random `u64`.
     pub boot: String,
     pub seq: u64,
-    /// Microseconds since the Unix epoch, converted on receipt from the
-    /// client's time since boot.
+    /// Microseconds since the Unix epoch.
     pub wall_us: u64,
     pub level: Level,
     pub target: String,
@@ -209,8 +208,6 @@ impl Api {
     }
 }
 
-/// `client=<32 hex>&limit=<n>`, `limit` optional. Values are not
-/// percent-decoded, since neither can contain an encoded character.
 fn logs_params(query: &str) -> Result<(ClientId, usize), String> {
     let mut client = None;
     let mut limit = DEFAULT_LOG_LIMIT;

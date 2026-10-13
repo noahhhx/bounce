@@ -36,8 +36,6 @@ pub struct Hub {
     /// What has been emitted as [`Effect::Subscribe`], so reconciling can
     /// emit only the difference.
     subscriptions: HashMap<ClientId, SourceId>,
-    /// The last snapshot loaded or emitted as [`Effect::Persist`], so only a
-    /// durable change is written.
     persisted: Snapshot,
 }
 
@@ -148,14 +146,12 @@ pub enum Effect {
     },
     AlertRaised(Alert),
     AlertCleared(AlertKey),
-    /// Durable state changed. Written to disk so it outlives a restart.
     Persist(Snapshot),
     /// For [`crate::http`] to serve as `/api/state`.
     StateChanged(StateView),
 }
 
 impl Hub {
-    /// Sources start idle at full volume. Clients in `saved` start offline.
     #[must_use]
     pub fn new(
         sources: impl IntoIterator<Item = (SourceId, SourceKind, String)>,
@@ -190,8 +186,6 @@ impl Hub {
     }
 
     /// Applies the event, then reconciles everything derived from state.
-    /// Always ends with [`Effect::StateChanged`], preceded by
-    /// [`Effect::Persist`] when durable state changed.
     pub fn handle(&mut self, event: HubEvent, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         let connected = self.apply(event, now, &mut effects);
@@ -690,8 +684,6 @@ mod tests {
         })
     }
 
-    /// Client 1 renamed into a kitchen routed to the tone at volume 30, then
-    /// disconnected. Returns the hub and the last snapshot it emitted.
     fn kitchen_then_gone(t0: Instant) -> (Hub, Snapshot) {
         let mut hub = hub();
         let mut events = vec![connected(1, 1)];

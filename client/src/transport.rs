@@ -26,7 +26,7 @@ pub trait Connector {
 pub trait Resolver {
     /// # Errors
     ///
-    /// When no server is found; the link backs off and retries.
+    /// When no server is found.
     fn resolve(&self) -> io::Result<SocketAddr>;
 }
 

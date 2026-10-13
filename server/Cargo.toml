@@ -5,5 +5,7 @@ description = "Spotify Connect target (librespot) and broadcast hub for connecte
 
 [dependencies]
 bounce-common = { path = "../common" }
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
 serde = { version = "1", features = ["derive"] }
+log = "0.4.34"
+env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }

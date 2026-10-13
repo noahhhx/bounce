@@ -8,11 +8,14 @@ pub mod test_tone;
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio::sync::mpsc::UnboundedSender;
 
+use bounce_common::ids::SourceId;
 use bounce_common::zone::Volume;
 
 use self::spotify::SpotifyConfig;
 use self::test_tone::TestToneConfig;
+use crate::hub::HubEvent;
 
 /// Each source shows up as one device in its casting app. Which zones hear
 /// it is decided in the web UI, not the casting app.
@@ -42,16 +45,44 @@ pub enum SourceConfig {
 
 /// Handed to a source on start. Wraps the channels to the hub and to this
 /// source's broadcaster, so a source only ever calls these two methods.
-pub struct SourceOutput {}
+/// Both are safe to call from a non-async thread, and both drop quietly once
+/// the receiver is gone at shutdown.
+#[derive(Clone)]
+pub struct SourceOutput {
+    source: SourceId,
+    events: UnboundedSender<HubEvent>,
+    /// Unbounded because the source paces itself to real time: the queue
+    /// only grows while the broadcaster stalls, and a source never blocks
+    /// or loses audio on a momentary stall.
+    pcm: UnboundedSender<Vec<i16>>,
+}
 
 impl SourceOutput {
+    #[must_use]
+    pub fn new(
+        source: SourceId,
+        events: UnboundedSender<HubEvent>,
+        pcm: UnboundedSender<Vec<i16>>,
+    ) -> Self {
+        Self {
+            source,
+            events,
+            pcm,
+        }
+    }
+
     /// Interleaved samples in the format of the last [`SourceEvent::Started`].
+    /// Call at the rate the audio plays: the broadcaster stamps each chunk's
+    /// play time on arrival.
     pub fn pcm(&self, samples: &[i16]) {
-        todo!()
+        let _ = self.pcm.send(samples.to_vec());
     }
 
     pub fn event(&self, event: SourceEvent) {
-        todo!()
+        let _ = self.events.send(HubEvent::Source {
+            source: self.source,
+            event,
+        });
     }
 }
 

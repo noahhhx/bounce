@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use log::{debug, info, warn};
 use tokio::sync::mpsc;
@@ -8,9 +8,12 @@ use bounce_common::ids::ClientId;
 use bounce_common::protocol::{
     ClientMessage, Hello, RejectReason, Rejected, ServerMessage, TimeSyncReply, PROTOCOL_VERSION,
 };
+use bounce_common::telemetry::LogBatch;
+use bounce_common::time::SinceBoot;
 use bounce_common::wire::WireError;
 
 use crate::clock;
+use crate::telemetry::{ClientClock, Telemetry};
 use crate::transport::{Connection, Listener};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,7 +92,11 @@ pub enum HandshakeError {
     Connection(WireError),
 }
 
-pub async fn accept<L: Listener>(mut listener: L, events: mpsc::UnboundedSender<SessionEvent>) {
+pub async fn accept<L: Listener>(
+    mut listener: L,
+    events: mpsc::UnboundedSender<SessionEvent>,
+    telemetry: Telemetry,
+) {
     let mut next = 0;
     loop {
         let (conn, addr) = match listener.accept().await {
@@ -104,7 +111,7 @@ pub async fn accept<L: Listener>(mut listener: L, events: mpsc::UnboundedSender<
         let session = SessionId(next);
         next += 1;
         debug!("session {}: connection from {addr}", session.0);
-        tokio::spawn(serve(conn, session, events.clone()));
+        tokio::spawn(serve(conn, session, events.clone(), telemetry.clone()));
     }
 }
 
@@ -112,6 +119,7 @@ pub async fn serve<C: Connection>(
     conn: C,
     session: SessionId,
     events: mpsc::UnboundedSender<SessionEvent>,
+    telemetry: Telemetry,
 ) {
     let (running, hello, outbox) = match Session::handshake(conn, session).await {
         Ok(opened) => opened,
@@ -123,7 +131,7 @@ pub async fn serve<C: Connection>(
         hello,
         outbox,
     });
-    running.run(&events).await;
+    running.run(&events, &telemetry).await;
 }
 
 struct Session<C: Connection> {
@@ -171,7 +179,10 @@ impl<C: Connection> Session<C> {
         Ok((session, hello, outbox))
     }
 
-    async fn run(mut self, events: &mpsc::UnboundedSender<SessionEvent>) {
+    /// Logs go to the telemetry task, never the hub, and are acked on this
+    /// connection once stored.
+    async fn run(mut self, events: &mpsc::UnboundedSender<SessionEvent>, telemetry: &Telemetry) {
+        let mut client_clock = None;
         let ended = loop {
             tokio::select! {
                 biased;
@@ -194,15 +205,24 @@ impl<C: Connection> Session<C> {
                         Ok(message) => message,
                         Err(error) => break Some(error),
                     };
-                    match &message {
+                    match message {
                         ClientMessage::Logs(batch) => {
-                            debug!(
-                                "session {}: dropped {} log records, no telemetry store yet",
-                                self.id.0,
-                                batch.records.len()
-                            );
+                            let boot = batch.boot;
+                            let clock = client_clock.unwrap_or_else(|| assume_sent_now(&batch));
+                            let client = self.client.clone();
+                            let Some(up_to) = telemetry.append_logs(client, batch, clock).await
+                            else {
+                                continue;
+                            };
+                            if let Err(error) = self.conn.send(&ServerMessage::LogsAck { boot, up_to }).await {
+                                break Some(error);
+                            }
                         }
                         ClientMessage::TimeSync(request) => {
+                            client_clock = Some(ClientClock {
+                                since_boot: request.client_sent,
+                                wall: SystemTime::now(),
+                            });
                             let reply = TimeSyncReply {
                                 client_sent: request.client_sent,
                                 server_received: received_at,
@@ -211,9 +231,9 @@ impl<C: Connection> Session<C> {
                             if let Err(error) = self.conn.send(&ServerMessage::TimeSync(reply)).await {
                                 break Some(error);
                             }
-                            self.forward(events, message);
+                            self.forward(events, ClientMessage::TimeSync(request));
                         }
-                        _ => self.forward(events, message),
+                        message => self.forward(events, message),
                     }
                 }
             }
@@ -236,15 +256,27 @@ impl<C: Connection> Session<C> {
     }
 }
 
+/// Before the client's first `TimeSync`, the best guess is that its newest
+/// record was logged just now.
+fn assume_sent_now(batch: &LogBatch) -> ClientClock {
+    let newest = batch.records.last().map(|record| record.at);
+    ClientClock {
+        since_boot: newest.unwrap_or(SinceBoot(Duration::ZERO)),
+        wall: SystemTime::now(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bounce_common::audio::Codec;
     use bounce_common::ids::{BootId, StreamId, Version};
     use bounce_common::protocol::{Command, TimeSyncRequest};
-    use bounce_common::time::{ServerInstant, SinceBoot};
+    use bounce_common::telemetry::{Level, LogRecord, LogSeq};
+    use bounce_common::time::ServerInstant;
     use bounce_common::update::Target;
 
     use super::*;
+    use crate::telemetry::{MemoryStore, Retention};
 
     struct FakeConn {
         incoming: mpsc::UnboundedReceiver<ClientMessage>,
@@ -321,7 +353,8 @@ mod tests {
     async fn opened(session: u64) -> (Peer, mpsc::UnboundedReceiver<SessionEvent>, Outbox) {
         let (conn, peer) = fake();
         let (events_tx, mut events) = mpsc::unbounded_channel();
-        tokio::spawn(serve(conn, SessionId(session), events_tx));
+        let telemetry = Telemetry::spawn(MemoryStore::new(Retention::default()));
+        tokio::spawn(serve(conn, SessionId(session), events_tx, telemetry));
         peer.to_server.send(hello(PROTOCOL_VERSION)).unwrap();
         let SessionEvent::Opened {
             session: id,
@@ -388,6 +421,48 @@ mod tests {
         let (conn, _peer) = fake();
         let result = Session::handshake(conn, SessionId(0)).await;
         assert!(matches!(result, Err(HandshakeError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn logs_are_stored_and_acked_on_the_session_without_reaching_the_hub() {
+        let (mut peer, mut events, _outbox) = opened(6).await;
+        let record = |seq| LogRecord {
+            seq: LogSeq(seq),
+            at: SinceBoot(Duration::from_millis(seq)),
+            level: Level::Info,
+            target: "t".into(),
+            message: "m".into(),
+            fields: Vec::new(),
+        };
+        let batch = LogBatch {
+            boot: BootId(1),
+            records: vec![record(1), record(2)],
+            dropped: 0,
+        };
+        for _ in 0..2 {
+            peer.to_server
+                .send(ClientMessage::Logs(batch.clone()))
+                .unwrap();
+            assert!(matches!(
+                peer.next().await,
+                ServerMessage::LogsAck {
+                    boot: BootId(1),
+                    up_to: LogSeq(2),
+                }
+            ));
+        }
+
+        let client_sent = SinceBoot(Duration::from_millis(9));
+        peer.to_server
+            .send(ClientMessage::TimeSync(TimeSyncRequest { client_sent }))
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            SessionEvent::Message {
+                message: ClientMessage::TimeSync(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

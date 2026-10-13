@@ -25,6 +25,7 @@ use bounce_server::snapshot::{self, Snapshot};
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
 use bounce_server::source::{Pcm, Source, SourceConfig, SourceOutput};
+use bounce_server::telemetry::{MemoryStore, Retention, Telemetry};
 use bounce_server::transport;
 use bounce_server::updates::ReleaseCatalog;
 
@@ -156,6 +157,7 @@ async fn main() {
         Instant::now(),
     );
     let (state, state_rx) = watch::channel(hub.view());
+    let telemetry = Telemetry::spawn(MemoryStore::new(Retention::default()));
     let api = http::serve(http_listener, events_tx.clone(), state_rx, releases);
     tokio::spawn(async move {
         let Err(error) = api.await;
@@ -166,6 +168,7 @@ async fn main() {
     tokio::spawn(session::accept(
         transport::TcpListener::from(session_listener),
         sessions_tx,
+        telemetry,
     ));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {

@@ -2,7 +2,7 @@
 
 {
   # https://devenv.sh/packages/
-  packages = [ pkgs.git ];
+  packages = [ pkgs.git pkgs.curl pkgs.jq ];
 
   # https://devenv.sh/languages/rust/
   languages.rust = {

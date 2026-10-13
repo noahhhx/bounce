@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
+RUNS="$REPO/target/verify"
+READY_PREFIX="bounce-server ready"
+
+die() { echo "bounce-local: $*" >&2; exit 1; }
+
+need_tools() {
+  local t
+  for t in curl jq ss setsid od awk; do
+    command -v "$t" >/dev/null || die "$t not on PATH. Run inside the devenv shell (direnv, or 'devenv shell -- $0 ...')."
+  done
+}
+
+client_id() { printf 'b0c0%028x' "$1"; }
+
+resolve_run() {
+  local run=${1:-${BOUNCE_RUN:-$RUNS/current}}
+  [[ -d $run ]] || die "no run at $run. Start one with '$0 up'."
+  readlink -f "$run"
+}
+
+load_env() {
+  RUN=$(resolve_run "${1:-}")
+  [[ -f $RUN/run.env ]] || die "$RUN never became ready, so there is nothing to drive. See $RUN/evidence/server.log, then run 'down'."
+  source "$RUN/run.env"
+}
+
+run_tag() { echo "bounce-local:$RUN"; }
+
+spawn() {
+  local name=$1; shift
+  printf '%s\0' "$@" >"$RUN/state/$name.cmd"
+  rm -f "$RUN/state/$name.exit"
+  LOG="$RUN/evidence/$name.log" EXIT="$RUN/state/$name.exit" \
+    setsid bash -c '"$@" >>"$LOG" 2>&1; echo $? >"$EXIT"' "$(run_tag)" "$@" </dev/null >/dev/null 2>&1 &
+  echo $! >"$RUN/pids/$name"
+}
+
+await_ready() {
+  local skip=$1 line deadline=$((SECONDS + 30))
+  while :; do
+    line=$(grep "^$READY_PREFIX " "$RUN/evidence/server.log" 2>/dev/null | sed -n "$((skip + 1))p")
+    [[ -n $line ]] && { echo "$line"; return; }
+    if [[ -e $RUN/state/server.exit ]]; then
+      echo "--- server.log tail" >&2; tail -n 20 "$RUN/evidence/server.log" >&2
+      die "bounce-server exited with status $(cat "$RUN/state/server.exit") before printing '$READY_PREFIX'. Run: $RUN"
+    fi
+    ((SECONDS < deadline)) || die "bounce-server printed no '$READY_PREFIX' line within 30s. Run: $RUN"
+    sleep 0.2
+  done
+}
+
+port_owned() {
+  local port=${1##*:} sid=$2 p found=0
+  for p in $(ss -ltnpH "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2); do
+    [[ $(ps -o sid= -p "$p" | tr -d ' ') == "$sid" ]] || return 1
+    found=1
+  done
+  ((found))
+}
+
+ours() {
+  local pid=$1
+  [[ -r /proc/$pid/cmdline ]] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF "$(run_tag)"
+}
+
+api() {
+  local method=$1 path=$2 body=${3:-} out status data=()
+  [[ -n $body ]] && data=(-H 'content-type: application/json' --data "$body")
+  out=$(mktemp)
+  status=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "${data[@]}" "http://$HTTP$path")
+  {
+    printf '%s %s %s %s\n' "$(date -Is)" "$method" "$path" "$status"
+    [[ -n $body ]] && printf '> %s\n' "$body"
+    printf '< %s\n' "$(head -c 4000 "$out")"
+  } >>"$RUN/evidence/api.log"
+  cat "$out"; rm -f "$out"
+  [[ $status == 2* ]] || die "$method $path returned $status"
+}
+
+cmd_up() {
+  local clients=2
+  while (($#)); do
+    case $1 in
+      --clients) clients=$2; shift 2 ;;
+      *) die "up: unknown flag $1" ;;
+    esac
+  done
+  need_tools
+  local bin=${BOUNCE_BIN_DIR:-$REPO/target/debug}
+  if [[ -z ${BOUNCE_BIN_DIR:-} ]]; then
+    cargo build --quiet --manifest-path "$REPO/Cargo.toml" -p bounce-server -p bounce-client
+  fi
+
+  RUN="$RUNS/$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$RUN"/{pids,state,evidence/wav}
+  ln -sfn "$RUN" "$RUNS/current"
+
+  spawn server "$bin/bounce-server" --listen 127.0.0.1:0 --http 127.0.0.1:0 \
+    --data-dir "$RUN/state/server" --no-mdns --source test-tone
+
+  local line session http
+  line=$(await_ready 0)
+  session=$(sed -n 's/.* session=\([^ ]*\).*/\1/p' <<<"$line")
+  http=$(sed -n 's/.* http=\([^ ]*\).*/\1/p' <<<"$line")
+  printf 'SESSION=%s\nHTTP=%s\nCLIENTS=%s\nBIN=%s\nPREBUILT=%s\n' "$session" "$http" "$clients" "$bin" "$([[ -n ${BOUNCE_BIN_DIR:-} ]] && echo 1 || echo 0)" >"$RUN/run.env"
+
+  local i
+  for ((i = 1; i <= clients; i++)); do
+    mkdir -p "$RUN/state/client-$i" "$RUN/evidence/wav/client-$i"
+    spawn "client-$i" "$bin/bounce-client" --client-id "$(client_id "$i")" \
+      --server "$session" --data-dir "$RUN/state/client-$i" \
+      --output "wav:$RUN/evidence/wav/client-$i"
+  done
+  echo "$RUN"
+}
+
+cmd_doctor() {
+  need_tools
+  load_env "${1:-}"
+  local ok=1 name pid
+  exec 3>&1 > >(tee "$RUN/evidence/doctor.txt" >&3)
+  {
+    echo "run      $RUN"
+    echo "server   session=$SESSION http=$HTTP"
+    for f in "$RUN"/state/*.cmd; do
+      name=$(basename "$f" .cmd); pid=$(cat "$RUN/pids/$name" 2>/dev/null || true)
+      if [[ -z $pid ]]; then
+        ok=0; echo "process  $name STOPPED by 'stop'; 'start $name' to restart"
+      elif ours "$pid" && [[ $(awk '{print $3}' "/proc/$pid/stat") == T ]]; then
+        ok=0; echo "process  $name pid=$pid FROZEN by 'freeze'; 'thaw $name' to resume"
+      elif ours "$pid"; then
+        echo "process  $name pid=$pid up"
+      else
+        ok=0
+        echo "process  $name pid=$pid DOWN (exit $(cat "$RUN/state/$name.exit" 2>/dev/null || echo unknown)); see evidence/$name.log"
+      fi
+    done
+    local newest
+    if [[ $PREBUILT == 1 ]]; then
+      echo "build    prebuilt binaries from $BIN; staleness not checked"
+    else
+      newest=$(find "$REPO"/{common,server,client} -name '*.rs' -newer "$BIN/bounce-server" -print -quit)
+      [[ -z $newest ]] && echo "build    current" || { ok=0; echo "build    STALE: $newest is newer than the binaries; rerun up"; }
+    fi
+    local addr
+    for addr in "$SESSION" "$HTTP"; do
+      if port_owned "$addr" "$(cat "$RUN/pids/server" 2>/dev/null || echo none)"; then
+        echo "port     $addr owned by this run's server"
+      else
+        ok=0; echo "port     $addr NOT owned by this run's server"
+      fi
+    done
+    local state
+    if state=$(curl -sfS "http://$HTTP/api/state" 2>&1); then
+      echo "api      /api/state answers"
+      jq -r --argjson n "$CLIENTS" '
+        "clients  \([.clients[] | select(.online)] | length)/\($n) online",
+        (.clients[] | "         \(.id) online=\(.online) zone=\(.zone) desired=\(.desired.revision) applied=\(.reported.applied // "none") player=\(.reported.player // "none" | tostring)"),
+        (.sources[] | "source   id=\(.id) \(.kind) \"\(.name)\" stream=\(.stream)")' <<<"$state"
+    else
+      ok=0; echo "api      /api/state FAILED: $state"
+    fi
+  }
+  ((ok)) && echo "verdict  healthy" || { echo "verdict  NOT HEALTHY"; exit 1; }
+}
+
+cmd_wait() {
+  local expr=$1 timeout=${2:-20}
+  load_env ""
+  local deadline=$((SECONDS + timeout)) state
+  while ((SECONDS < deadline)); do
+    state=$(curl -sfS "http://$HTTP/api/state" 2>/dev/null) && jq -e "$expr" <<<"$state" >/dev/null && {
+      printf '%s WAIT %s ok\n' "$(date -Is)" "$expr" >>"$RUN/evidence/api.log"; return 0; }
+    sleep 0.5
+  done
+  printf '%s WAIT %s TIMEOUT after %ss\n< %s\n' "$(date -Is)" "$expr" "$timeout" "${state:-}" >>"$RUN/evidence/api.log"
+  die "timed out after ${timeout}s waiting for: $expr"
+}
+
+wav_format() {
+  echo "$(od -An -t u2 -j 22 -N 2 "$1" | tr -d ' ')" "$(od -An -t u4 -j 24 -N 4 "$1" | tr -d ' ')"
+}
+
+abs_peak() { od -An -v -t d2 -w2 | awk '{ v = $1 < 0 ? -$1 : $1; if (v > p) p = v } END { print p + 0 }'; }
+
+clicks() {
+  local wav=$1 timing=${1%.wav}.timing channels rate peak
+  read -r channels rate < <(wav_format "$wav")
+  peak=$(tail -c +45 "$wav" | abs_peak)
+  ((peak > 0)) || return 0
+  od -An -v -t d2 -w2 -j 44 "$wav" | awk -v ch="$channels" -v rate="$rate" -v peak="$peak" -v timing="$timing" '
+    BEGIN {
+      n = 0
+      while ((getline l < timing) > 0) { split(l, f, " "); tf[n] = f[1]; tp[n] = f[2]; n++ }
+      threshold = peak / 2; min_gap = rate / 2
+      last = -rate; k = -1
+    }
+    {
+      frame = int((NR - 1) / ch)
+      v = $1 < 0 ? -$1 : $1
+      if (v > threshold && frame - last > min_gap) {
+        last = frame
+        while (k + 1 < n && tf[k + 1] <= frame) k++
+        if (k >= 0) printf "%d %d\n", frame, tp[k] + (frame - tf[k]) * 1000000 / rate
+      }
+    }'
+}
+
+cmd_peak() {
+  local wav=$1 secs=${2:-1} channels rate
+  [[ -f $wav ]] || die "no WAV at $wav"
+  read -r channels rate < <(wav_format "$wav")
+  tail -c "$((secs * rate * channels * 2))" "$wav" | abs_peak
+}
+
+cmd_sync() {
+  load_env ""
+  local wavs=() w
+  mapfile -t wavs < <(find "$RUN/evidence/wav" -name 'stream-*.wav' | sort)
+  ((${#wavs[@]} >= 2)) || die "sync needs WAVs from at least two clients; found ${#wavs[@]}"
+  for w in "${wavs[@]}"; do
+    clicks "$w" | awk -v name="${w#"$RUN"/evidence/wav/}" '{ print name, $1, $2 }'
+  done | tee "$RUN/evidence/clicks.txt" | awk '
+    { sec = int(($3 + 500000) / 1000000); t[sec] = t[sec] " " $3; c[sec]++ }
+    END {
+      for (sec in t) {
+        split(substr(t[sec], 2), v, " "); lo = v[1]; hi = v[1]
+        for (i in v) { if (v[i] < lo) lo = v[i]; if (v[i] > hi) hi = v[i] }
+        printf "second %d clients=%d spread_us=%d\n", sec, c[sec], hi - lo
+      }
+    }' | sort -n -k2 | tee "$RUN/evidence/sync.txt"
+}
+
+cmd_down() {
+  RUN=$(resolve_run "${1:-}")
+  local f pid
+  for f in "$RUN"/pids/*; do
+    [[ -e $f ]] || continue
+    pid=$(cat "$f")
+    if ours "$pid"; then kill -CONT -- "-$pid" 2>/dev/null || true; kill -TERM -- "-$pid" 2>/dev/null || true; fi
+  done
+  for f in "$RUN"/pids/*; do
+    [[ -e $f ]] || continue
+    reap "$(cat "$f")"
+  done
+  rm -rf "$RUN/state" "$RUN/pids"
+  echo "stopped. evidence kept in $RUN/evidence"
+}
+
+reap() {
+  local pid=$1
+  for _ in $(seq 50); do ours "$pid" || return 0; sleep 0.1; done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+}
+
+pid_of() {
+  [[ -f $RUN/pids/$1 ]] || die "$1 is not running in $RUN (see $RUN/pids/)"
+  local pid; pid=$(cat "$RUN/pids/$1")
+  ours "$pid" || die "$1 (pid $pid) is not running"
+  echo "$pid"
+}
+
+cmd_stop() {
+  local name=$1 signal=TERM pid
+  [[ ${2:-} == --kill ]] && signal=KILL
+  pid=$(pid_of "$name")
+  kill -CONT -- "-$pid" 2>/dev/null || true; kill -"$signal" -- "-$pid"
+  reap "$pid"
+  rm -f "$RUN/pids/$name"
+}
+
+pin_server_ports() {
+  local -n argv=$1
+  local i
+  for i in "${!argv[@]}"; do
+    [[ ${argv[i]} == --listen ]] && argv[i+1]=$SESSION
+    [[ ${argv[i]} == --http ]] && argv[i+1]=$HTTP
+  done
+  return 0
+}
+
+cmd_start() {
+  local name=$1 skip args=()
+  [[ -f $RUN/pids/$name ]] && ours "$(cat "$RUN/pids/$name")" && die "$name is already running"
+  [[ -f $RUN/state/$name.cmd ]] || die "no recorded command for $name in $RUN"
+  mapfile -d '' -t args <"$RUN/state/$name.cmd"
+  if [[ $name == server ]]; then
+    pin_server_ports args
+    skip=$(grep -c "^$READY_PREFIX " "$RUN/evidence/server.log" || true)
+    spawn server "${args[@]}"
+    await_ready "$skip" >/dev/null
+  else
+    spawn "$name" "${args[@]}"
+  fi
+}
+
+case ${1:-} in
+  up) shift; cmd_up "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  api) shift; need_tools; load_env ""; api "$@" ;;
+  wait) shift; need_tools; cmd_wait "$@" ;;
+  sync) shift; need_tools; cmd_sync "$@" ;;
+  peak) shift; cmd_peak "$@" ;;
+  stop) shift; load_env ""; cmd_stop "$@" ;;
+  start) shift; load_env ""; cmd_start "$@" ;;
+  freeze) load_env ""; kill -STOP -- "-$(pid_of "$2")" ;;
+  thaw) load_env ""; kill -CONT -- "-$(pid_of "$2")" ;;
+  client-id) client_id "$2" ;;
+  down) shift; cmd_down "$@" ;;
+  runs) ls -1t "$RUNS" 2>/dev/null | grep -v '^current$' || true ;;
+  *) die "usage: bounce-local up [--clients N] | doctor [run] | api GET|POST <path> [json] | wait <jq expr> [secs] | sync | peak <wav> [secs] | stop <name> [--kill] | start <name> | freeze <name> | thaw <name> | client-id <n> | down [run] | runs" ;;
+esac

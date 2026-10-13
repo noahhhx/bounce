@@ -221,6 +221,7 @@ mod tests {
     use bounce_common::wire;
 
     use super::*;
+    use crate::player::Output;
     use crate::tests::desired;
     use crate::transport::Tcp;
 
@@ -251,7 +252,7 @@ mod tests {
                 initial: Duration::from_millis(10),
                 max: Duration::from_millis(50),
             };
-            let mut link = Link::new(Tcp, server, backoff, hello(), Device::default());
+            let mut link = Link::new(Tcp, server, backoff, hello(), Device::new(Output::Alsa));
             configure(&mut link);
             link.run()
         });

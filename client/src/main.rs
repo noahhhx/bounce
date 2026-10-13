@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use bounce_client::clock;
 use bounce_client::config::{Config, OutputBackend};
 use bounce_client::link::{Backoff, Link};
+use bounce_client::player::{Output, WavOutput};
 use bounce_client::transport::Tcp;
 use bounce_client::Device;
 use bounce_common::audio::Codec;
@@ -42,7 +43,11 @@ fn main() -> ExitCode {
 
     let hello = hello(&config);
     info!(client = ?hello.client, boot = hello.boot.0, %server, "starting");
-    Link::new(Tcp, server, Backoff::default(), hello, Device::default()).run()
+    let output = match config.output {
+        OutputBackend::Alsa => Output::Alsa,
+        OutputBackend::Wav { dir } => Output::Wav(WavOutput { dir }),
+    };
+    Link::new(Tcp, server, Backoff::default(), hello, Device::new(output)).run()
 }
 
 fn hello(config: &Config) -> Hello {

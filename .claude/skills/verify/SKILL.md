@@ -37,16 +37,17 @@ change.
 - WAV sink: `stream-<id>.wav` (16-bit PCM, 44-byte header) next to
   `stream-<id>.timing` (`<first frame> <play_at us>` per chunk).
 
-**Current status (2026-10-13).** The server's `main` parses its flags and
-runs the Spotify source, but binds no listeners and prints no ready line.
-The test-tone source is still `todo!()` and panics on start, so `$B up`
-stops with
-`bounce-server exited with status 101 before printing 'bounce-server ready'`.
-The client's `main` is still empty. That is the
-correct report for these binaries, not a harness bug. Once the test tone
-plays and the server binds, prints the ready line and serves `/api/state`,
-the rest works unchanged. The harness was checked end to end against
-stand-in binaries that follow the contract above.
+**Current status (2026-10-13).** `$B up` succeeds. The server binds both
+listeners, prints the ready line, and plays the test tone, which its log
+shows as `source 0: pcm samples=96000 peak=32767` once a second. `$B doctor`
+still reports NOT HEALTHY for two expected reasons. The clients show
+`DOWN (exit 0)` because the client's `main` is still empty. `/api/state`
+times out because nothing accepts on the HTTP port until `http::serve`
+exists. The broadcaster is built but not yet wired into `main`, because it
+needs the hub to assign stream ids and sessions to subscribe clients.
+Once `/api/state` answers and the client runs, the rest works unchanged.
+The harness was checked end to end against stand-in binaries that follow
+the contract above.
 
 ## Launch
 

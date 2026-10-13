@@ -1,10 +1,12 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use log::{info, warn};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use bounce_common::ids::SourceId;
-use bounce_server::config::Config;
+use bounce_server::config::{Config, READY_PREFIX};
 use bounce_server::hub::HubEvent;
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
@@ -20,6 +22,14 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    let session_listener = bind("--listen", config.listen).await;
+    let http_listener = bind("--http", config.http).await;
+    println!(
+        "{READY_PREFIX} session={} http={}",
+        local_addr(&session_listener),
+        local_addr(&http_listener)
+    );
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
@@ -76,4 +86,17 @@ async fn meter(source: SourceId, mut pcm: UnboundedReceiver<Vec<i16>>) {
             }
         }
     }
+}
+
+async fn bind(flag: &str, addr: SocketAddr) -> TcpListener {
+    TcpListener::bind(addr).await.unwrap_or_else(|error| {
+        eprintln!("bounce-server: {flag} {addr}: {error}");
+        std::process::exit(1);
+    })
+}
+
+fn local_addr(listener: &TcpListener) -> SocketAddr {
+    listener
+        .local_addr()
+        .expect("a bound listener has an address")
 }

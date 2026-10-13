@@ -71,7 +71,7 @@ api() {
   local method=$1 path=$2 body=${3:-} out status data=()
   [[ -n $body ]] && data=(-H 'content-type: application/json' --data "$body")
   out=$(mktemp)
-  status=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "${data[@]}" "http://$HTTP$path")
+  status=$(curl -sS --max-time 10 -o "$out" -w '%{http_code}' -X "$method" "${data[@]}" "http://$HTTP$path")
   {
     printf '%s %s %s %s\n' "$(date -Is)" "$method" "$path" "$status"
     [[ -n $body ]] && printf '> %s\n' "$body"
@@ -155,7 +155,7 @@ cmd_doctor() {
       fi
     done
     local state
-    if state=$(curl -sfS "http://$HTTP/api/state" 2>&1); then
+    if state=$(curl -sfS --max-time 5 "http://$HTTP/api/state" 2>&1); then
       echo "api      /api/state answers"
       jq -r --argjson n "$CLIENTS" '
         "clients  \([.clients[] | select(.online)] | length)/\($n) online",
@@ -173,7 +173,7 @@ cmd_wait() {
   load_env ""
   local deadline=$((SECONDS + timeout)) state
   while ((SECONDS < deadline)); do
-    state=$(curl -sfS "http://$HTTP/api/state" 2>/dev/null) && jq -e "$expr" <<<"$state" >/dev/null && {
+    state=$(curl -sfS --max-time 2 "http://$HTTP/api/state" 2>/dev/null) && jq -e "$expr" <<<"$state" >/dev/null && {
       printf '%s WAIT %s ok\n' "$(date -Is)" "$expr" >>"$RUN/evidence/api.log"; return 0; }
     sleep 0.5
   done

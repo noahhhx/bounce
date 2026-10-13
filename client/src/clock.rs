@@ -3,11 +3,20 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use bounce_common::protocol::{TimeSyncReply, TimeSyncRequest};
 use bounce_common::time::{ClockOffset, ServerInstant, SinceBoot};
+
+static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// Time since the first call in this process, which `main` makes before
+/// anything else.
+#[must_use]
+pub fn now() -> SinceBoot {
+    SinceBoot(ORIGIN.get_or_init(Instant::now).elapsed())
+}
 
 #[derive(Default)]
 pub struct ClockSync {

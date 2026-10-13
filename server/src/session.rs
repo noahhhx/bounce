@@ -26,12 +26,24 @@ pub struct Outbox {
 }
 
 impl Outbox {
+    /// The audio lane holds more than a playout delay of chunks, so a late
+    /// joiner gets every pending chunk the broadcaster replays to it.
+    pub(crate) fn channel() -> (
+        Self,
+        mpsc::UnboundedReceiver<ServerMessage>,
+        mpsc::Receiver<AudioChunk>,
+    ) {
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let (audio, audio_rx) = mpsc::channel(256);
+        (Self { control, audio }, control_rx, audio_rx)
+    }
+
     pub fn control(&self, message: ServerMessage) {
-        todo!()
+        let _ = self.control.send(message);
     }
 
     pub fn audio(&self, chunk: AudioChunk) {
-        todo!("try_send, count drops")
+        let _ = self.audio.try_send(chunk);
     }
 }
 

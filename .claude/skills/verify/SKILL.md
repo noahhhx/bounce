@@ -37,13 +37,16 @@ change.
 - WAV sink: `stream-<id>.wav` (16-bit PCM, 44-byte header) next to
   `stream-<id>.timing` (`<first frame> <play_at us>` per chunk).
 
-**Current status (2026-10-13).** Every body is still `todo!()` and both
-`main`s are empty. `$B up` therefore stops with
-`bounce-server exited with status 0 before printing 'bounce-server ready'`.
-That is the correct report for these binaries, not a harness bug. Once the
-server's `main` binds, prints the ready line and serves `/api/state`, the
-rest works unchanged. The harness was checked end to end against stand-in
-binaries that follow the contract above.
+**Current status (2026-10-13).** The server's `main` parses its flags and
+runs the Spotify source, but binds no listeners and prints no ready line.
+The test-tone source is still `todo!()` and panics on start, so `$B up`
+stops with
+`bounce-server exited with status 101 before printing 'bounce-server ready'`.
+The client's `main` is still empty. That is the
+correct report for these binaries, not a harness bug. Once the test tone
+plays and the server binds, prints the ready line and serves `/api/state`,
+the rest works unchanged. The harness was checked end to end against
+stand-in binaries that follow the contract above.
 
 ## Launch
 

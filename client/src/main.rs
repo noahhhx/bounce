@@ -34,15 +34,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(server) = config.server else {
-        eprintln!(
-            "bounce-client: --server <host:port> is required; finding the server over mDNS is not supported yet"
-        );
-        return ExitCode::from(2);
-    };
+    let server = config.server;
 
     let hello = hello(&config);
-    info!(client = ?hello.client, boot = hello.boot.0, %server, "starting");
+    info!(client = ?hello.client, boot = hello.boot.0, ?server, "starting");
     let output = match config.output {
         OutputBackend::Alsa => Output::Alsa,
         OutputBackend::Wav { dir } => Output::Wav(WavOutput {

@@ -20,14 +20,28 @@ impl Drop for Running {
 }
 
 #[test]
-fn without_server_exits_2_and_says_why() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bounce-client"))
-        .args(["--client-id", ID, "--output", "wav:/nonexistent"])
-        .output()
+fn without_server_keeps_running_to_discover_one() {
+    let mut client = Running(
+        Command::new(env!("CARGO_BIN_EXE_bounce-client"))
+            .args(["--client-id", ID, "--data-dir", "/nonexistent"])
+            .args(["--output", "wav:/nonexistent"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    thread::sleep(Duration::from_millis(500));
+    assert!(client.0.try_wait().unwrap().is_none(), "client exited");
+    let _ = client.0.kill();
+    let mut stderr = String::new();
+    client
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--server"), "{stderr}");
+    assert!(stderr.contains("server=Discover"), "{stderr}");
 }
 
 #[test]

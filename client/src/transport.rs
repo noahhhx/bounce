@@ -4,11 +4,15 @@
 //! [`bounce_common::wire`].
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, SocketAddrV6, TcpStream};
 use std::time::{Duration, Instant};
 
-use bounce_common::protocol::{ClientMessage, ServerMessage};
+use bounce_common::protocol::{ClientMessage, ServerMessage, MDNS_SERVICE};
 use bounce_common::wire::{self, WireError, MAX_FRAME_LEN};
+use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent};
+use tracing::info;
+
+use crate::config::Server;
 
 pub trait Connector {
     type Conn: Connection;
@@ -17,6 +21,13 @@ pub trait Connector {
     ///
     /// Any IO error; the link backs off and retries.
     fn connect(&self, server: SocketAddr) -> io::Result<Self::Conn>;
+}
+
+pub trait Resolver {
+    /// # Errors
+    ///
+    /// When no server is found; the link backs off and retries.
+    fn resolve(&self) -> io::Result<SocketAddr>;
 }
 
 pub trait Connection {
@@ -61,6 +72,64 @@ impl Connector for Tcp {
             read_buf: Vec::new(),
         })
     }
+}
+
+/// Responders answer within 120 ms (RFC 6762 section 6). This leaves room
+/// for the browser's retransmits when a query or answer is lost.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl Resolver for Server {
+    fn resolve(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Fixed(server) => Ok(*server),
+            Self::Discover => discover(DISCOVERY_TIMEOUT),
+        }
+    }
+}
+
+/// A fresh daemon per lookup, so a server that changed address is never
+/// answered from a stale cache, and no mDNS thread runs while connected.
+fn discover(timeout: Duration) -> io::Result<SocketAddr> {
+    let daemon = ServiceDaemon::new().map_err(io::Error::other)?;
+    let found = browse(&daemon, timeout);
+    let _ = daemon.shutdown();
+    found
+}
+
+fn browse(daemon: &ServiceDaemon, timeout: Duration) -> io::Result<SocketAddr> {
+    let events = daemon.browse(MDNS_SERVICE).map_err(io::Error::other)?;
+    let deadline = Instant::now() + timeout;
+    while let Ok(event) = events.recv_deadline(deadline) {
+        let ServiceEvent::ServiceResolved(service) = event else {
+            continue;
+        };
+        let port = service.get_port();
+        let offered = service
+            .get_addresses()
+            .iter()
+            .map(|ip| socket_addr(ip, port));
+        if let Some(server) = prefer_ipv4(offered) {
+            info!(name = service.get_fullname(), %server, "discovered server");
+            return Ok(server);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no {MDNS_SERVICE} answered within {timeout:?}"),
+    ))
+}
+
+fn socket_addr(ip: &ScopedIp, port: u16) -> SocketAddr {
+    match ip {
+        ScopedIp::V6(v6) => SocketAddrV6::new(*v6.addr(), port, 0, v6.scope_id().index).into(),
+        ip => SocketAddr::new(ip.to_ip_addr(), port),
+    }
+}
+
+fn prefer_ipv4(offered: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    offered
+        .into_iter()
+        .min_by_key(|addr| (addr.is_ipv6(), *addr))
 }
 
 impl TcpConnection {
@@ -183,6 +252,15 @@ mod tests {
             conn.recv(Duration::from_secs(5)),
             Err(WireError::Closed)
         ));
+    }
+
+    #[test]
+    fn discovery_prefers_ipv4_when_both_are_offered() {
+        let v6 = SocketAddr::from(([0xfe80, 0, 0, 0, 0, 0, 0, 1], 7700));
+        let v4 = SocketAddr::from(([192, 168, 1, 5], 7700));
+        assert_eq!(prefer_ipv4([v6, v4]), Some(v4));
+        assert_eq!(prefer_ipv4([v6]), Some(v6));
+        assert_eq!(prefer_ipv4([]), None);
     }
 
     #[test]

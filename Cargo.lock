@@ -181,6 +181,7 @@ name = "bounce-client"
 version = "0.1.0"
 dependencies = [
  "bounce-common",
+ "mdns-sd",
  "tracing",
  "tracing-subscriber",
 ]

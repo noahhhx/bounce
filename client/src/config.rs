@@ -6,11 +6,21 @@ use bounce_common::ids::ClientId;
 pub struct Config {
     /// `--client-id <32 hex>`, otherwise `/etc/machine-id`.
     pub client_id: ClientId,
-    /// `--server <host:port>`, which skips mDNS discovery.
-    pub server: Option<SocketAddr>,
+    pub server: Server,
     /// `--data-dir <path>`, default `/var/lib/bounce`.
     pub data_dir: PathBuf,
     pub output: OutputBackend,
+}
+
+/// Where the link connects, looked up again on every connect so a server
+/// that moved is found again. See [`crate::transport::Resolver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Server {
+    /// `--server <host:port>`.
+    Fixed(SocketAddr),
+    /// The default, which browses mDNS for
+    /// [`MDNS_SERVICE`](bounce_common::protocol::MDNS_SERVICE).
+    Discover,
 }
 
 /// `--output alsa` (default) or `--output wav:<dir>`.
@@ -37,7 +47,7 @@ impl Config {
     /// `/etc/machine-id` when `--client-id` is absent.
     pub fn from_args(mut args: impl Iterator<Item = String>) -> Result<Self, ConfigError> {
         let mut client_id = None;
-        let mut server = None;
+        let mut server = Server::Discover;
         let mut data_dir = PathBuf::from("/var/lib/bounce");
         let mut output = OutputBackend::Alsa;
 
@@ -45,7 +55,7 @@ impl Config {
             let mut value = |flag| args.next().ok_or(ConfigError::MissingValue(flag));
             match arg.as_str() {
                 "--client-id" => client_id = Some(value("--client-id")?),
-                "--server" => server = Some(parse_addr("--server", value("--server")?)?),
+                "--server" => server = Server::Fixed(parse_addr("--server", value("--server")?)?),
                 "--data-dir" => data_dir = value("--data-dir")?.into(),
                 "--output" => output = parse_output(value("--output")?)?,
                 _ => return Err(ConfigError::UnknownFlag(arg)),
@@ -118,7 +128,7 @@ mod tests {
         assert_eq!(config.client_id, ClientId::parse(ID).unwrap());
         assert_eq!(
             config.server,
-            Some(SocketAddr::from(([127, 0, 0, 1], 7700)))
+            Server::Fixed(SocketAddr::from(([127, 0, 0, 1], 7700)))
         );
         assert_eq!(config.data_dir, Path::new("/tmp/c1"));
         assert!(
@@ -127,9 +137,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_alsa_and_var_lib_with_no_server() {
+    fn defaults_to_alsa_var_lib_and_discovery() {
         let config = parse(&["--client-id", ID]).unwrap();
-        assert_eq!(config.server, None);
+        assert_eq!(config.server, Server::Discover);
         assert_eq!(config.data_dir, Path::new("/var/lib/bounce"));
         assert!(matches!(config.output, OutputBackend::Alsa));
         let explicit = parse(&["--client-id", ID, "--output", "alsa"]).unwrap();

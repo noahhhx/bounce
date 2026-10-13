@@ -1,5 +1,4 @@
 use std::io;
-use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +10,7 @@ use bounce_common::wire::WireError;
 use tracing::info;
 
 use crate::clock;
-use crate::transport::{Connection, Connector};
+use crate::transport::{Connection, Connector, Resolver};
 use crate::Device;
 
 enum LinkState<T> {
@@ -32,6 +31,7 @@ enum LinkState<T> {
 
 #[derive(Debug)]
 enum Disconnect {
+    Resolve(io::Error),
     Connect(io::Error),
     Wire(WireError),
     Rejected(RejectReason),
@@ -49,9 +49,9 @@ impl From<WireError> for Disconnect {
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_secs(1);
 
-pub struct Link<C: Connector> {
+pub struct Link<C: Connector, R: Resolver> {
     connector: C,
-    server: SocketAddr,
+    server: R,
     backoff: Backoff,
     hello: Hello,
     device: Device,
@@ -101,14 +101,8 @@ impl XorShift {
     }
 }
 
-impl<C: Connector> Link<C> {
-    pub fn new(
-        connector: C,
-        server: SocketAddr,
-        backoff: Backoff,
-        hello: Hello,
-        device: Device,
-    ) -> Self {
+impl<C: Connector, R: Resolver> Link<C, R> {
+    pub fn new(connector: C, server: R, backoff: Backoff, hello: Hello, device: Device) -> Self {
         let seed = hello.boot.0.max(1);
         Self {
             connector,
@@ -137,11 +131,12 @@ impl<C: Connector> Link<C> {
     fn step(&mut self, state: LinkState<C::Conn>) -> Result<LinkState<C::Conn>, Disconnect> {
         match state {
             LinkState::Connecting => {
+                let server = self.server.resolve().map_err(Disconnect::Resolve)?;
                 let mut conn = self
                     .connector
-                    .connect(self.server)
+                    .connect(server)
                     .map_err(Disconnect::Connect)?;
-                info!(server = %self.server, "connected");
+                info!(%server, "connected");
                 conn.send(&ClientMessage::Hello(self.hello.clone()))?;
                 Ok(LinkState::Handshaking { conn })
             }
@@ -210,8 +205,10 @@ fn send_all(conn: &mut impl Connection, messages: Vec<ClientMessage>) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io::{ErrorKind, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use bounce_common::audio::Codec;
@@ -221,6 +218,7 @@ mod tests {
     use bounce_common::wire;
 
     use super::*;
+    use crate::config::Server;
     use crate::player::Output;
     use crate::tests::desired;
     use crate::transport::Tcp;
@@ -244,19 +242,53 @@ mod tests {
         }
     }
 
-    fn start(configure: impl FnOnce(&mut Link<Tcp>) + Send + 'static) -> TcpListener {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let server = listener.local_addr().unwrap();
+    const BACKOFF: Backoff = Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(50),
+    };
+
+    fn run<R: Resolver + Send + 'static>(
+        server: R,
+        configure: impl FnOnce(&mut Link<Tcp, R>) + Send + 'static,
+    ) {
         thread::spawn(move || {
-            let backoff = Backoff {
-                initial: Duration::from_millis(10),
-                max: Duration::from_millis(50),
-            };
-            let mut link = Link::new(Tcp, server, backoff, hello(), Device::new(Output::Alsa));
+            let mut link = Link::new(Tcp, server, BACKOFF, hello(), Device::new(Output::Alsa));
             configure(&mut link);
             link.run()
         });
+    }
+
+    fn start(configure: impl FnOnce(&mut Link<Tcp, Server>) + Send + 'static) -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        run(Server::Fixed(listener.local_addr().unwrap()), configure);
         listener
+    }
+
+    /// Stands in for mDNS. Answers in order, then finds nothing.
+    #[derive(Clone, Default)]
+    struct Discovery(Arc<Mutex<VecDeque<io::Result<SocketAddr>>>>);
+
+    impl Discovery {
+        fn answer(&self, answer: io::Result<SocketAddr>) {
+            self.0.lock().unwrap().push_back(answer);
+        }
+
+        fn unanswered(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    impl Resolver for Discovery {
+        fn resolve(&self) -> io::Result<SocketAddr> {
+            let next = self.0.lock().unwrap().pop_front();
+            next.unwrap_or_else(|| Err(ErrorKind::NotFound.into()))
+        }
+    }
+
+    fn listen() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
     }
 
     fn accept(listener: &TcpListener) -> Session {
@@ -373,6 +405,50 @@ mod tests {
 
         let mut second = accept(&listener);
         expect_hello(&mut second);
+    }
+
+    #[test]
+    fn discovery_connects_to_the_server_it_found() {
+        let (listener, addr) = listen();
+        let discovery = Discovery::default();
+        discovery.answer(Ok(addr));
+        run(discovery, |_| {});
+
+        expect_hello(&mut accept(&listener));
+    }
+
+    #[test]
+    fn finding_nothing_backs_off_and_looks_again() {
+        let (listener, addr) = listen();
+        let discovery = Discovery::default();
+        discovery.answer(Err(ErrorKind::NotFound.into()));
+        discovery.answer(Err(ErrorKind::NotFound.into()));
+        discovery.answer(Ok(addr));
+        let started = Instant::now();
+        run(discovery.clone(), |_| {});
+
+        expect_hello(&mut accept(&listener));
+        assert_eq!(discovery.unanswered(), 0);
+        let least = BACKOFF.initial / 2 + BACKOFF.initial;
+        assert!(started.elapsed() >= least, "retried without backing off");
+    }
+
+    #[test]
+    fn a_reconnect_looks_the_server_up_again() {
+        let (old, old_addr) = listen();
+        let (new, new_addr) = listen();
+        let discovery = Discovery::default();
+        discovery.answer(Ok(old_addr));
+        run(discovery.clone(), |_| {});
+
+        let mut first = accept(&old);
+        expect_hello(&mut first);
+        first.send(&ServerMessage::Desired(desired(1)));
+        assert!(matches!(first.recv(), ClientMessage::Reported(_)));
+        discovery.answer(Ok(new_addr));
+        drop(first);
+
+        expect_hello(&mut accept(&new));
     }
 
     #[test]

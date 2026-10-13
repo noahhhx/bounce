@@ -1,8 +1,8 @@
 //! Turns one source's PCM into timestamped [`AudioChunk`]s and fans them
 //! out to every client in a zone routed to that source. One broadcaster per
 //! source is what keeps zones on the same source in sync. This is the hot
-//! path, so chunks go straight to each session's [`Outbox`] and do not pass
-//! through the hub.
+//! path, so chunks go straight to each session's [`AudioLane`] and do not
+//! pass through the hub.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -11,7 +11,7 @@ use bounce_common::audio::{AudioChunk, AudioFormat, Codec};
 use bounce_common::ids::{ClientId, StreamId};
 use bounce_common::time::ServerInstant;
 
-use crate::session::Outbox;
+use crate::session::AudioLane;
 
 /// How far the next chunk's slot may drift from `now + playout_delay`
 /// before the timeline restarts there. Larger than the lead a source may
@@ -27,7 +27,7 @@ pub struct Broadcaster {
     stream: Option<Stream>,
     /// Subscribers follow the source, not a stream, so they stay across
     /// stream starts.
-    subscribers: HashMap<ClientId, Outbox>,
+    subscribers: HashMap<ClientId, AudioLane>,
 }
 
 struct Stream {
@@ -113,19 +113,19 @@ impl Broadcaster {
         while stream.pending.front().is_some_and(|c| c.play_at <= now) {
             stream.pending.pop_front();
         }
-        for outbox in self.subscribers.values() {
-            outbox.audio(chunk.clone());
+        for lane in self.subscribers.values() {
+            lane.send(chunk.clone());
         }
         stream.pending.push_back(chunk);
     }
 
     /// A late joiner receives the chunks still ahead of their deadline, so
     /// it starts in sync instead of waiting a full playout delay.
-    pub fn subscribe(&mut self, client: ClientId, outbox: Outbox) {
+    pub fn subscribe(&mut self, client: ClientId, lane: AudioLane) {
         for chunk in self.stream.iter().flat_map(|s| &s.pending) {
-            outbox.audio(chunk.clone());
+            lane.send(chunk.clone());
         }
-        self.subscribers.insert(client, outbox);
+        self.subscribers.insert(client, lane);
     }
 
     pub fn unsubscribe(&mut self, client: &ClientId) {
@@ -149,6 +149,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::session::Outbox;
 
     const TEN_MS: [i16; 2 * 480] = [0; 2 * 480];
 
@@ -174,7 +175,7 @@ mod tests {
 
     fn subscribe(b: &mut Broadcaster, n: u8) -> mpsc::Receiver<AudioChunk> {
         let (outbox, _, audio) = Outbox::channel();
-        b.subscribe(client(n), outbox);
+        b.subscribe(client(n), outbox.audio_lane());
         audio
     }
 

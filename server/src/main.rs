@@ -4,25 +4,104 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use log::{debug, info, warn};
+use log::{info, warn};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
-use bounce_common::ids::SourceId;
+use bounce_common::ids::{ClientId, SourceId};
+use bounce_common::protocol::ServerMessage;
 use bounce_server::broadcast::Broadcaster;
 use bounce_server::clock;
 use bounce_server::config::{Config, READY_PREFIX};
 use bounce_server::health::Thresholds;
 use bounce_server::http;
 use bounce_server::hub::{Effect, Hub, HubEvent};
+use bounce_server::session::{self, AudioLane, Outbox, SessionEvent, SessionId};
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
 use bounce_server::source::{Pcm, Source, SourceConfig, SourceOutput};
+use bounce_server::transport;
 use bounce_server::updates::ReleaseCatalog;
 
 /// Snapcast's default.
 const PLAYOUT_DELAY: Duration = Duration::from_secs(1);
+
+/// Where the hub's session effects go: each client's current session, and
+/// each source's broadcast task.
+#[derive(Default)]
+struct Routing {
+    clients: HashMap<ClientId, Route>,
+    broadcasters: HashMap<SourceId, UnboundedSender<Subscription>>,
+}
+
+struct Route {
+    session: SessionId,
+    outbox: Outbox,
+}
+
+/// What a source's broadcast task hears from main, besides its PCM.
+enum Subscription {
+    Subscribe(ClientId, AudioLane),
+    Unsubscribe(ClientId),
+}
+
+impl Routing {
+    /// Updates the table, then says what the hub should hear. An `Opened`
+    /// for a client that already has a route replaces it, and dropping the
+    /// old outbox ends the old session. A `Closed` removes only its own
+    /// session's route, since the client may already have reconnected.
+    fn session_event(&mut self, event: SessionEvent) -> HubEvent {
+        match event {
+            SessionEvent::Opened {
+                session,
+                hello,
+                outbox,
+            } => {
+                let route = Route { session, outbox };
+                self.clients.insert(hello.client.clone(), route);
+                HubEvent::Connected { hello, session }
+            }
+            SessionEvent::Message { client, message } => HubEvent::Message { client, message },
+            SessionEvent::Closed { client, session } => {
+                if self
+                    .clients
+                    .get(&client)
+                    .is_some_and(|r| r.session == session)
+                {
+                    self.clients.remove(&client);
+                }
+                HubEvent::Disconnected { client, session }
+            }
+        }
+    }
+
+    fn send(&self, to: &ClientId, message: ServerMessage) {
+        if let Some(route) = self.clients.get(to) {
+            route.outbox.control(message);
+        }
+    }
+
+    /// Dropping the outbox closes the control lane, which ends the session
+    /// even while a broadcaster still holds its audio lane.
+    fn close(&mut self, client: &ClientId) {
+        self.clients.remove(client);
+    }
+
+    fn subscribe(&self, source: SourceId, client: ClientId) {
+        let route = self.clients.get(&client);
+        if let (Some(route), Some(broadcaster)) = (route, self.broadcasters.get(&source)) {
+            let lane = route.outbox.audio_lane();
+            let _ = broadcaster.send(Subscription::Subscribe(client, lane));
+        }
+    }
+
+    fn unsubscribe(&self, source: SourceId, client: ClientId) {
+        if let Some(broadcaster) = self.broadcasters.get(&source) {
+            let _ = broadcaster.send(Subscription::Unsubscribe(client));
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -46,10 +125,13 @@ async fn main() {
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let streams = Arc::new(AtomicU64::new(unix_micros()));
     let mut sources: HashMap<SourceId, Box<dyn Source>> = HashMap::new();
+    let mut routing = Routing::default();
     for (id, source_config) in (0..).zip(config.sources) {
         let id = SourceId(id);
         let (pcm_tx, pcm_rx) = mpsc::unbounded_channel();
-        tokio::spawn(broadcast(id, pcm_rx));
+        let (subscriptions_tx, subscriptions_rx) = mpsc::unbounded_channel();
+        tokio::spawn(broadcast(id, pcm_rx, subscriptions_rx));
+        routing.broadcasters.insert(id, subscriptions_tx);
         let mut source: Box<dyn Source> = match source_config {
             SourceConfig::Spotify(c) => Box::new(SpotifySource::new(c)),
             SourceConfig::TestTone(c) => Box::new(TestToneSource::new(c)),
@@ -78,12 +160,18 @@ async fn main() {
         eprintln!("bounce-server: http: {error}");
         std::process::exit(1);
     });
+    let (sessions_tx, mut sessions) = mpsc::unbounded_channel();
+    tokio::spawn(session::accept(
+        transport::TcpListener::from(session_listener),
+        sessions_tx,
+    ));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let event = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = tick.tick() => HubEvent::Tick,
             Some(event) = events.recv() => event,
+            Some(event) = sessions.recv() => routing.session_event(event),
         };
         for effect in hub.handle(event, Instant::now()) {
             match effect {
@@ -95,10 +183,10 @@ async fn main() {
                         source.control(control);
                     }
                 }
-                Effect::Send { .. }
-                | Effect::Close { .. }
-                | Effect::Subscribe { .. }
-                | Effect::Unsubscribe { .. } => debug!("no session to apply {effect:?}"),
+                Effect::Send { to, message } => routing.send(&to, message),
+                Effect::Close { client } => routing.close(&client),
+                Effect::Subscribe { source, client } => routing.subscribe(source, client),
+                Effect::Unsubscribe { source, client } => routing.unsubscribe(source, client),
                 Effect::AlertRaised(alert) => info!("alert raised: {alert:?}"),
                 Effect::AlertCleared(key) => info!("alert cleared: {key:?}"),
             }
@@ -118,16 +206,26 @@ async fn main() {
     }
 }
 
-/// Nothing subscribes yet: only sessions produce an outbox.
-async fn broadcast(source: SourceId, mut pcm: UnboundedReceiver<Pcm>) {
+async fn broadcast(
+    source: SourceId,
+    mut pcm: UnboundedReceiver<Pcm>,
+    mut subscriptions: UnboundedReceiver<Subscription>,
+) {
     let mut broadcaster = Broadcaster::new(PLAYOUT_DELAY);
-    while let Some(pcm) = pcm.recv().await {
-        match pcm {
-            Pcm::Start { stream, format } => {
-                info!("source {}: stream {} {format:?}", source.0, stream.0);
-                broadcaster.start(stream, format);
-            }
-            Pcm::Samples(samples) => broadcaster.push_pcm(&samples, clock::now()),
+    loop {
+        tokio::select! {
+            Some(change) = subscriptions.recv() => match change {
+                Subscription::Subscribe(client, lane) => broadcaster.subscribe(client, lane),
+                Subscription::Unsubscribe(client) => broadcaster.unsubscribe(&client),
+            },
+            pcm = pcm.recv() => match pcm {
+                Some(Pcm::Start { stream, format }) => {
+                    info!("source {}: stream {} {format:?}", source.0, stream.0);
+                    broadcaster.start(stream, format);
+                }
+                Some(Pcm::Samples(samples)) => broadcaster.push_pcm(&samples, clock::now()),
+                None => break,
+            },
         }
     }
 }

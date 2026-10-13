@@ -5,7 +5,10 @@
 //!   [`hub::HubEvent`]s and acts on the [`hub::Effect`]s it returns. No
 //!   locks.
 //! - One [`session`] task per connected client, generic over
-//!   [`transport::Connection`].
+//!   [`transport::Connection`]. Sessions report to `main` on one ordered
+//!   channel. `main` keeps each client's current outbox in a routing table,
+//!   updates it before passing the event to the hub, and applies the
+//!   hub's effects through it.
 //! - One [`source::Source`] and one [`broadcast::Broadcaster`] per source.
 //!   The web UI routes sources to zones. Audio goes source to broadcaster to
 //!   session outboxes, never through the hub.

@@ -5,8 +5,12 @@ description = "Spotify Connect target (librespot) and broadcast hub for connecte
 
 [dependencies]
 bounce-common = { path = "../common" }
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
 log = "0.4.34"
 env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }
 librespot = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "with-libmdns"] }

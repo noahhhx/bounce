@@ -38,16 +38,17 @@ change.
   `stream-<id>.timing` (`<first frame> <play_at us>` per chunk).
 
 **Current status (2026-10-13).** `$B up` succeeds. The server binds both
-listeners, prints the ready line, and plays the test tone, which its log
-shows as `source 0: pcm samples=96000 peak=32767` once a second. `$B doctor`
-still reports NOT HEALTHY for two expected reasons. The clients show
-`DOWN (exit 0)` because the client's `main` is still empty. `/api/state`
-times out because nothing accepts on the HTTP port until `http::serve`
-exists. The broadcaster is built but not yet wired into `main`, because it
-needs the hub to assign stream ids and sessions to subscribe clients.
-Once `/api/state` answers and the client runs, the rest works unchanged.
-The harness was checked end to end against stand-in binaries that follow
-the contract above.
+listeners, prints the ready line, and plays the test tone through its
+broadcaster, which its log shows as `source 0: stream <id> AudioFormat {..}`
+when the stream starts. `/api/state` answers, so `$B up --clients 0` gives
+a healthy doctor with a `stream=<id>` source line. Admin requests apply,
+and `$B wait` sees them in the next `/api/state`. With clients, `$B doctor`
+still reports NOT HEALTHY: the clients show `DOWN (exit 0)` because the
+client's `main` is still empty. The hub's `Send` and `Subscribe` effects
+wait on sessions, so no client receives desired state or audio yet. Once
+the client runs and sessions carry those effects, the rest works
+unchanged. The harness was checked end to end against stand-in binaries
+that follow the contract above.
 
 ## Launch
 

@@ -198,9 +198,13 @@ dependencies = [
  "bounce-common",
  "env_logger",
  "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "librespot",
  "log",
  "serde",
+ "serde_json",
  "sha1",
  "tokio",
 ]

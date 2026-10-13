@@ -14,6 +14,7 @@ use bounce_server::broadcast::Broadcaster;
 use bounce_server::clock;
 use bounce_server::config::{Config, READY_PREFIX};
 use bounce_server::health::Thresholds;
+use bounce_server::http;
 use bounce_server::hub::{Effect, Hub, HubEvent};
 use bounce_server::source::spotify::SpotifySource;
 use bounce_server::source::test_tone::TestToneSource;
@@ -62,14 +63,21 @@ async fn main() {
         sources.insert(id, source);
     }
 
+    let releases = config.data_dir.join("releases");
     let mut hub = Hub::new(
         sources
             .iter()
             .map(|(&id, source)| (id, source.kind(), source.name().to_owned())),
-        ReleaseCatalog::new(config.data_dir.join("releases")),
+        ReleaseCatalog::new(releases.clone()),
         Thresholds::default(),
     );
-    let (state, _) = watch::channel(hub.view());
+    let (state, state_rx) = watch::channel(hub.view());
+    let api = http::serve(http_listener, events_tx.clone(), state_rx, releases);
+    tokio::spawn(async move {
+        let Err(error) = api.await;
+        eprintln!("bounce-server: http: {error}");
+        std::process::exit(1);
+    });
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let event = tokio::select! {

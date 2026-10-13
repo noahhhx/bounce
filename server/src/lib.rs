@@ -26,6 +26,7 @@ pub mod fleet;
 pub mod health;
 pub mod http;
 pub mod hub;
+pub mod mdns;
 pub mod session;
 pub mod snapshot;
 pub mod source;

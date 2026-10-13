@@ -17,6 +17,7 @@ env_logger = { version = "0.11.11", default-features = false, features = ["human
 librespot = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "with-libmdns"] }
 sha1 = "0.10"
 futures-util = { version = "0.3", default-features = false }
+mdns-sd = { version = "0.21.5", default-features = false, features = ["logging"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["test-util"] }

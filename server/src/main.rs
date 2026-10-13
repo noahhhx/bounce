@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{error, info, warn};
+use mdns_sd::ServiceDaemon;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -18,6 +19,7 @@ use bounce_server::config::{Config, READY_PREFIX};
 use bounce_server::health::Thresholds;
 use bounce_server::http;
 use bounce_server::hub::{Effect, Hub, HubEvent};
+use bounce_server::mdns;
 use bounce_server::session::{self, AudioLane, Outbox, SessionEvent, SessionId};
 use bounce_server::snapshot::{self, Snapshot};
 use bounce_server::source::spotify::SpotifySource;
@@ -116,6 +118,9 @@ async fn main() {
         local_addr(&session_listener),
         local_addr(&http_listener)
     );
+    let mdns = config
+        .advertise
+        .then(|| advertise(local_addr(&session_listener)));
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let streams = Arc::new(AtomicU64::new(unix_micros()));
@@ -195,6 +200,22 @@ async fn main() {
         }
     }
     stop(sources).await;
+    if let Some(Ok(done)) = mdns.flatten().map(|daemon| daemon.shutdown()) {
+        let _ = done.recv_timeout(Duration::from_secs(1));
+    }
+}
+
+fn advertise(session: SocketAddr) -> Option<ServiceDaemon> {
+    match mdns::advertise(session) {
+        Ok((daemon, name)) => {
+            info!("advertising {name} over mDNS");
+            Some(daemon)
+        }
+        Err(error) => {
+            warn!("not advertising over mDNS, so clients need --server: {error}");
+            None
+        }
+    }
 }
 
 async fn stop(mut sources: HashMap<SourceId, Box<dyn Source>>) {

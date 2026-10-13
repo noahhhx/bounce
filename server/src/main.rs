@@ -126,27 +126,8 @@ async fn main() {
         .then(|| advertise(local_addr(&session_listener)));
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
-    let streams = Arc::new(AtomicU64::new(unix_micros()));
-    let mut sources: HashMap<SourceId, Box<dyn Source>> = HashMap::new();
     let mut routing = Routing::default();
-    for (id, source_config) in (0..).zip(config.sources) {
-        let id = SourceId(id);
-        let (pcm_tx, pcm_rx) = mpsc::unbounded_channel();
-        let (subscriptions_tx, subscriptions_rx) = mpsc::unbounded_channel();
-        tokio::spawn(broadcast(id, pcm_rx, subscriptions_rx));
-        routing.broadcasters.insert(id, subscriptions_tx);
-        let mut source: Box<dyn Source> = match source_config {
-            SourceConfig::Spotify(c) => Box::new(SpotifySource::new(c)),
-            SourceConfig::TestTone(c) => Box::new(TestToneSource::new(c)),
-        };
-        source.start(SourceOutput::new(
-            id,
-            events_tx.clone(),
-            pcm_tx,
-            streams.clone(),
-        ));
-        sources.insert(id, source);
-    }
+    let mut sources = start_sources(config.sources, &events_tx, &mut routing);
 
     let releases = config.data_dir.join("releases");
     let mut hub = Hub::new(
@@ -210,6 +191,35 @@ async fn main() {
     if let Some(Ok(done)) = mdns.flatten().map(|daemon| daemon.shutdown()) {
         let _ = done.recv_timeout(Duration::from_secs(1));
     }
+}
+
+/// Starts each source with its own broadcaster, registered in `routing`.
+fn start_sources(
+    configs: Vec<SourceConfig>,
+    events: &UnboundedSender<HubEvent>,
+    routing: &mut Routing,
+) -> HashMap<SourceId, Box<dyn Source>> {
+    let streams = Arc::new(AtomicU64::new(unix_micros()));
+    let mut sources: HashMap<SourceId, Box<dyn Source>> = HashMap::new();
+    for (id, source_config) in (0..).zip(configs) {
+        let id = SourceId(id);
+        let (pcm_tx, pcm_rx) = mpsc::unbounded_channel();
+        let (subscriptions_tx, subscriptions_rx) = mpsc::unbounded_channel();
+        tokio::spawn(broadcast(id, pcm_rx, subscriptions_rx));
+        routing.broadcasters.insert(id, subscriptions_tx);
+        let mut source: Box<dyn Source> = match source_config {
+            SourceConfig::Spotify(c) => Box::new(SpotifySource::new(c)),
+            SourceConfig::TestTone(c) => Box::new(TestToneSource::new(c)),
+        };
+        source.start(SourceOutput::new(
+            id,
+            events.clone(),
+            pcm_tx,
+            streams.clone(),
+        ));
+        sources.insert(id, source);
+    }
+    sources
 }
 
 fn advertise(session: SocketAddr) -> Option<ServiceDaemon> {

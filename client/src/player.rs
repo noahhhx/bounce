@@ -2,6 +2,7 @@
 //! ALSA. This is where sync is won or lost.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
@@ -50,7 +51,7 @@ pub struct PlaybackCounters {
 pub struct Player {
     state: PlayerState,
     buffer: JitterBuffer,
-    output: AlsaOutput,
+    output: Output,
     clock: SharedOffset,
     counters: Arc<PlaybackCounters>,
 }
@@ -62,14 +63,30 @@ pub struct JitterBuffer {
     chunks: VecDeque<AudioChunk>,
 }
 
+pub enum Output {
+    Alsa(AlsaOutput),
+    Wav(WavOutput),
+}
+
 pub struct AlsaOutput {
     device: String,
+}
+
+/// Writes in real time, paced by the same deadlines, so underrun padding
+/// and volume land in the file exactly as they would at the DAC.
+///
+/// Each stream gets `<dir>/stream-<id>.wav`, 16-bit PCM behind the canonical
+/// 44-byte header (sizes rewritten after every write, so the file is
+/// readable while the client runs), and `<dir>/stream-<id>.timing`, one
+/// `<first frame> <play_at us>` line per chunk written.
+pub struct WavOutput {
+    dir: PathBuf,
 }
 
 impl PlayerHandle {
     /// Spawns the audio thread at real-time priority.
     #[must_use]
-    pub fn spawn(clock: SharedOffset) -> Self {
+    pub fn spawn(clock: SharedOffset, output: Output) -> Self {
         todo!()
     }
 

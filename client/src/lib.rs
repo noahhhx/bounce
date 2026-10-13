@@ -16,6 +16,7 @@
 )]
 
 pub mod clock;
+pub mod config;
 pub mod link;
 pub mod player;
 pub mod telemetry;

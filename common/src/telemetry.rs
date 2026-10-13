@@ -55,11 +55,14 @@ pub struct MetricsSample {
 pub struct SystemMetrics {
     pub cpu_load_1m: f32,
     pub mem_available_kib: u64,
-    pub soc_temp_millicelsius: i32,
-    pub throttled: bool,
+    /// Absent where the device exposes no thermal zone.
+    pub soc_temp_millicelsius: Option<i32>,
+    /// Absent without `vcgencmd`, as off a Pi.
+    pub throttled: Option<bool>,
     /// Absent on wired clients.
     pub wifi_rssi_dbm: Option<i8>,
-    pub undervoltage_events_total: u64,
+    /// Absent without `vcgencmd`, as off a Pi.
+    pub undervoltage_events_total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

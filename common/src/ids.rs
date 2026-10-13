@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Read from `/etc/machine-id` on the device, so it survives reinstalls of
 /// the client binary and needs no provisioning step.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct ClientId(String);
 
 impl ClientId {
@@ -10,6 +11,14 @@ impl ClientId {
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         todo!()
+    }
+}
+
+impl TryFrom<String> for ClientId {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw).ok_or("client id must be 32 lowercase hex characters")
     }
 }
 

@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use serde::Deserialize;
+
 use bounce_common::audio::AudioFormat;
 use bounce_common::ids::{ClientId, SourceId, StreamId, Version, ZoneId};
 use bounce_common::protocol::{ClientMessage, Command, DesiredState, Hello, ServerMessage};
@@ -13,6 +15,7 @@ use bounce_common::zone::{Volume, Zone};
 
 use crate::fleet::{ClientRecord, Fleet};
 use crate::health::{Alert, AlertKey, Thresholds};
+use crate::http::StateView;
 use crate::source::{SourceControl, SourceEvent, SourceKind, TrackMetadata};
 use crate::updates::ReleaseCatalog;
 
@@ -69,7 +72,12 @@ pub enum HubEvent {
 }
 
 /// What the web UI can ask for.
+#[derive(Debug, Deserialize)]
 pub enum AdminRequest {
+    UpsertZone {
+        zone: ZoneId,
+        name: String,
+    },
     MoveClient {
         client: ClientId,
         zone: Option<ZoneId>,
@@ -127,10 +135,16 @@ pub enum Effect {
     },
     AlertRaised(Alert),
     AlertCleared(AlertKey),
+    /// For [`crate::http`] to serve as `/api/state`.
+    StateChanged(StateView),
 }
 
 impl Hub {
     pub fn handle(&mut self, event: HubEvent, now: Instant) -> Vec<Effect> {
+        todo!()
+    }
+
+    fn view(&self) -> StateView {
         todo!()
     }
 

@@ -3,10 +3,16 @@
 //! never learns which source produced the audio.
 
 pub mod spotify;
+pub mod test_tone;
 
 use std::time::Duration;
 
+use serde::Serialize;
+
 use bounce_common::zone::Volume;
+
+use self::spotify::SpotifyConfig;
+use self::test_tone::TestToneConfig;
 
 /// Each source shows up as one device in its casting app. Which zones hear
 /// it is decided in the web UI, not the casting app.
@@ -23,9 +29,15 @@ pub trait Source: Send {
     fn stop(&mut self);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SourceKind {
     Spotify,
+    TestTone,
+}
+
+pub enum SourceConfig {
+    Spotify(SpotifyConfig),
+    TestTone(TestToneConfig),
 }
 
 /// Handed to a source on start. Wraps the channels to the hub and to this

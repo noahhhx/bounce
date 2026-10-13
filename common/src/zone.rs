@@ -19,6 +19,7 @@ pub struct Zone {
 
 /// 0 to 100, clamped at construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "u8")]
 pub struct Volume(u8);
 
 impl Volume {
@@ -30,5 +31,11 @@ impl Volume {
     #[must_use]
     pub fn percent(self) -> u8 {
         self.0
+    }
+}
+
+impl From<u8> for Volume {
+    fn from(percent: u8) -> Self {
+        Self::new(percent)
     }
 }

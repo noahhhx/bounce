@@ -7,9 +7,8 @@
 //! - One [`session`] task per connected client, generic over
 //!   [`transport::Connection`].
 //! - One [`source::Source`] and one [`broadcast::Broadcaster`] per source.
-//!   Today that is a single Spotify Connect device; the web UI routes it to
-//!   zones. Audio goes source to broadcaster to session outboxes, never
-//!   through the hub.
+//!   The web UI routes sources to zones. Audio goes source to broadcaster to
+//!   session outboxes, never through the hub.
 //! - One task owns the [`telemetry::TelemetryStore`] and ingests logs and
 //!   metrics, which are too high-volume to route through the hub.
 
@@ -21,8 +20,10 @@
 )]
 
 pub mod broadcast;
+pub mod config;
 pub mod fleet;
 pub mod health;
+pub mod http;
 pub mod hub;
 pub mod session;
 pub mod source;

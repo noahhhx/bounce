@@ -64,7 +64,7 @@ impl SharedOffset {
         )))
     }
 
-    fn set(&self, offset: Option<ClockOffset>) {
+    pub(crate) fn set(&self, offset: Option<ClockOffset>) {
         self.0
             .store(offset.map_or(i64::MIN, |o| o.0), Ordering::Relaxed);
     }

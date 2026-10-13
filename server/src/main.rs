@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use log::info;
+use log::{info, warn};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use bounce_common::ids::SourceId;
@@ -43,8 +43,17 @@ async fn main() {
             }
         }
     }
-    for source in &mut sources {
-        source.stop();
+    let stopping: Vec<_> = sources.iter_mut().filter_map(|s| s.stop()).collect();
+    let all_stopped = async {
+        for task in stopping {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), all_stopped)
+        .await
+        .is_err()
+    {
+        warn!("sources still stopping after 5s; exiting anyway");
     }
 }
 

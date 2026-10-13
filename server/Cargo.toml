@@ -9,3 +9,6 @@ tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "sync", "tim
 serde = { version = "1", features = ["derive"] }
 log = "0.4.34"
 env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }
+librespot = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "with-libmdns"] }
+sha1 = "0.10"
+futures-util = { version = "0.3", default-features = false }

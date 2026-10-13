@@ -4,6 +4,8 @@
 //! The signal is a quiet sine with a full-scale 5 ms click at every whole
 //! second of stream time.
 
+use tokio::task::JoinHandle;
+
 use super::{Source, SourceControl, SourceKind, SourceOutput};
 
 pub struct TestToneConfig {
@@ -36,7 +38,7 @@ impl Source for TestToneSource {
         todo!("scale the generated signal")
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Option<JoinHandle<()>> {
         todo!()
     }
 }

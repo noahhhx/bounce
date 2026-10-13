@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 
 use bounce_common::ids::SourceId;
 use bounce_common::zone::Volume;
@@ -29,7 +30,10 @@ pub trait Source: Send {
     /// web UI, that the app should reflect.
     fn control(&mut self, control: SourceControl);
 
-    fn stop(&mut self);
+    /// The returned task ends once the source has released its sockets and
+    /// mDNS records. Await it before the runtime shuts down: librespot's mDNS
+    /// responder aborts the process if its tasks are torn down first.
+    fn stop(&mut self) -> Option<JoinHandle<()>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

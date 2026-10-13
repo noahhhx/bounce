@@ -2,3 +2,6 @@
 name = "bounce-client"
 edition = "2021"
 description = "Audio player for speaker-attached devices, receives the broadcast stream"
+
+[dependencies]
+bounce-common = { path = "../common" }

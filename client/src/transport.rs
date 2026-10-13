@@ -64,7 +64,6 @@ impl Connector for Tcp {
 }
 
 impl TcpConnection {
-    /// Takes one whole frame off the front of `read_buf`, if there is one.
     fn take_frame(&mut self) -> Result<Option<ServerMessage>, WireError> {
         let Some(prefix) = self.read_buf.first_chunk::<4>() else {
             return Ok(None);
@@ -128,7 +127,6 @@ mod tests {
 
     use super::*;
 
-    /// A connected client side and the server's end of the same socket.
     fn pair() -> (TcpConnection, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let conn = Tcp.connect(listener.local_addr().unwrap()).unwrap();

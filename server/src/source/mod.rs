@@ -111,6 +111,10 @@ impl SourceOutput {
         self.event(SourceEvent::Started { stream, format });
     }
 
+    pub fn stop_stream(&self) {
+        self.event(SourceEvent::Stopped);
+    }
+
     /// Interleaved samples in the format of the last
     /// [`SourceOutput::start_stream`]. Call at the rate the audio plays: the
     /// broadcaster stamps each chunk's play time on arrival.
@@ -128,10 +132,10 @@ impl SourceOutput {
 
 #[derive(Debug, Clone)]
 pub enum SourceEvent {
-    /// Sources call [`SourceOutput::start_stream`] rather than building
-    /// this, so the broadcaster always hears of the stream too. Send it and
-    /// [`SourceEvent::Stopped`] from the thread that writes the samples, so
-    /// the hub hears them in the order the streams ran.
+    /// Sources call [`SourceOutput::start_stream`] and
+    /// [`SourceOutput::stop_stream`] rather than building this and
+    /// [`SourceEvent::Stopped`], so the broadcaster always hears of the
+    /// stream too.
     Started {
         stream: StreamId,
         format: AudioFormat,

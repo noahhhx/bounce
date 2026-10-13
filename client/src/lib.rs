@@ -1,9 +1,9 @@
 //! Thread layout, with no async runtime so the client stays small:
 //!
-//! - The main thread runs the [`link::Link`], which owns the [`Device`]. It
-//!   does every non-audio thing.
+//! - The main thread runs the [`link::Link`] and the [`Device`]. It does
+//!   every non-audio thing.
 //! - The audio thread owns the [`player::Player`] and the ALSA handle. It
-//!   never touches the network or blocks on a lock the network thread holds.
+//!   never touches the network or blocks on a lock the main thread holds.
 //!   It reads the clock offset and writes playback counters through atomics.
 //! - The `tracing` layer writes into the shared [`telemetry::LogBuffer`]
 //!   from whatever thread logged.
@@ -37,16 +37,11 @@ use crate::clock::ClockSync;
 /// everything the server hears from it. The link feeds it messages and
 /// ticks, and sends what it returns.
 pub struct Device {
-    /// `None` until the first `Desired`. The player stays silent until
-    /// then.
     desired: Option<DesiredState>,
     clock: ClockSync,
-    /// When `tick` next sends a `TimeSync`.
     next_sync: SinceBoot,
 }
 
-/// Also the heartbeat: the server takes a client offline after 15 s
-/// without a message, and this is the one the client always sends.
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Default for Device {
@@ -60,8 +55,6 @@ impl Default for Device {
 }
 
 impl Device {
-    /// A new session started. The server may have restarted, so its clock
-    /// is measured again from scratch, starting at the next tick.
     pub fn on_connect(&mut self) {
         self.clock.reset();
         self.next_sync = SinceBoot(Duration::ZERO);
@@ -92,8 +85,8 @@ impl Device {
         }
     }
 
-    /// Called every second. Sends at most one `TimeSync` per
-    /// [`SYNC_INTERVAL`], however often it is called.
+    /// Sends at most one `TimeSync` per `SYNC_INTERVAL`, however often it
+    /// is called.
     pub fn tick(&mut self, now: SinceBoot) -> Vec<ClientMessage> {
         if now < self.next_sync {
             return Vec::new();

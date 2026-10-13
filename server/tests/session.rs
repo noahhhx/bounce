@@ -1,6 +1,3 @@
-//! Runs the server binary with a test tone and plays a client by hand over
-//! the wire: connect, apply desired state, get routed, hear audio, leave.
-
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -100,7 +97,6 @@ async fn admin(server: &Server, request: &str) {
     http(server, "POST", "/api/admin", request).await;
 }
 
-/// The client's entry in `/api/state`, once `ready` holds for it.
 async fn client_state(server: &Server, ready: impl Fn(&Value) -> bool) -> Value {
     for _ in 0..50 {
         let state: Value =

@@ -40,8 +40,6 @@ pub struct ClientRecord {
 
 pub enum Liveness {
     Online {
-        /// A `Disconnected` from any other session is stale: it comes from
-        /// the half-open socket this session replaced.
         session: SessionId,
         boot: BootId,
         connected_at: Instant,
@@ -135,5 +133,12 @@ impl ClientRecord {
     #[must_use]
     pub fn is_online(&self) -> bool {
         matches!(self.liveness, Liveness::Online { .. })
+    }
+
+    /// A close from any other session comes from a half-open socket that
+    /// this one replaced.
+    #[must_use]
+    pub fn is_online_in(&self, session: SessionId) -> bool {
+        matches!(self.liveness, Liveness::Online { session: s, .. } if s == session)
     }
 }

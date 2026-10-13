@@ -14,10 +14,10 @@ use tracing::info;
 
 #[cfg(target_arch = "aarch64")]
 const TARGET: Target = Target::Aarch64;
-/// Telling a Pi Zero's ARMv6 apart needs its own build target, which does
-/// not exist yet.
-#[cfg(target_arch = "arm")]
+#[cfg(all(target_arch = "arm", target_feature = "v7"))]
 const TARGET: Target = Target::ArmV7;
+#[cfg(all(target_arch = "arm", not(target_feature = "v7")))]
+const TARGET: Target = Target::ArmV6;
 #[cfg(target_arch = "x86_64")]
 const TARGET: Target = Target::X86_64;
 
@@ -76,9 +76,6 @@ fn version_part(part: &str) -> u16 {
     part.parse().expect("crate version parts fit in u16")
 }
 
-/// Wall-clock nanoseconds mixed with the pid. The clock may be wrong on a
-/// Pi without NTP yet, but it still moves between starts, and the pid
-/// separates two starts in the same instant.
 fn boot_id() -> BootId {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

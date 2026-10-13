@@ -45,8 +45,6 @@ pub struct SourceState {
     /// The casting app's volume slider. A client's output volume is this
     /// scaled by its zone's volume.
     pub volume: Volume,
-    /// The source's, not the stream's: a track outlives a pause, and can be
-    /// announced before the stream that plays it starts.
     pub track: Option<TrackMetadata>,
     pub playback: SourcePlayback,
 }
@@ -129,7 +127,6 @@ pub enum Effect {
         to: ClientId,
         message: ServerMessage,
     },
-    /// Sent when a heartbeat times out on a socket that still looks open.
     Close {
         client: ClientId,
     },
@@ -211,10 +208,8 @@ impl Hub {
                 return Some(client);
             }
             HubEvent::Disconnected { client, session } => {
-                // A replaced session's close can arrive after its
-                // replacement's connect, and must not take the client offline.
-                let current = |record: &&mut ClientRecord| matches!(record.liveness, Liveness::Online { session: s, .. } if s == session);
-                if let Some(record) = self.client_mut(&client).filter(current) {
+                let record = self.client_mut(&client)?;
+                if record.is_online_in(session) {
                     record.liveness = Liveness::Offline {
                         since: now,
                         cause: OfflineCause::ConnectionClosed,

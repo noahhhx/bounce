@@ -1,10 +1,3 @@
-//! One task per client. Reads `Hello`, hands main an [`Outbox`] in
-//! [`SessionEvent::Opened`], then pumps messages both ways until the
-//! connection drops or main drops the outbox. The session answers time
-//! sync itself, so the reply's stamps never wait behind the hub. Logs are
-//! dropped until the telemetry store exists; everything else goes to the
-//! hub.
-
 use std::time::Duration;
 
 use log::{debug, info, warn};
@@ -22,15 +15,9 @@ use crate::transport::{Connection, Listener};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Minted by the accept loop, one per connection. A client id survives a
-/// reconnect and a boot id survives a Wi-Fi drop, so only this tells a
-/// reconnected session from the half-open one it replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
-/// What sessions tell main, on one channel so each session's events stay
-/// in order. Main must route a session's outbox before the hub hears it
-/// connected, because the hub's first effect for it is a `Send`.
 pub enum SessionEvent {
     Opened {
         session: SessionId,
@@ -47,22 +34,16 @@ pub enum SessionEvent {
     },
 }
 
-/// The write side of a session, held by main's routing table.
-///
 /// Two lanes, because the two kinds of traffic fail differently. Control
 /// messages are few and must arrive, so that lane is unbounded. Audio is
 /// constant and goes stale within a second, so that lane is bounded and
 /// drops chunks when full. A slow client then falls behind instead of
 /// growing server memory.
-///
-/// Not `Clone`: this is the only control sender, so dropping it ends the
-/// session even while a broadcaster still holds its [`AudioLane`].
 pub struct Outbox {
     control: mpsc::UnboundedSender<ServerMessage>,
     audio: AudioLane,
 }
 
-/// The audio half of an [`Outbox`], for broadcasters.
 #[derive(Clone)]
 pub struct AudioLane(mpsc::Sender<AudioChunk>);
 
@@ -103,14 +84,11 @@ impl AudioLane {
 pub enum HandshakeError {
     /// No `Hello` within the handshake timeout.
     Timeout,
-    /// The first message was not `Hello`.
-    Malformed,
-    /// Sent `Rejected` and closed.
+    NotHello,
     Rejected,
     Connection(WireError),
 }
 
-/// Accepts until the process exits, one session task per connection.
 pub async fn accept<L: Listener>(mut listener: L, events: mpsc::UnboundedSender<SessionEvent>) {
     let mut next = 0;
     loop {
@@ -130,7 +108,6 @@ pub async fn accept<L: Listener>(mut listener: L, events: mpsc::UnboundedSender<
     }
 }
 
-/// One connection's whole life: handshake, `Opened`, run, `Closed`.
 pub async fn serve<C: Connection>(
     conn: C,
     session: SessionId,
@@ -158,10 +135,6 @@ struct Session<C: Connection> {
 }
 
 impl<C: Connection> Session<C> {
-    /// Waits for `Hello` and checks the protocol version. A mismatch gets
-    /// `Rejected` with no upgrade, because releases cannot be published
-    /// yet. Once they can, the upgrade is how an old client gets new enough
-    /// to be accepted.
     async fn handshake(
         mut conn: C,
         id: SessionId,
@@ -171,7 +144,7 @@ impl<C: Connection> Session<C> {
             .map_err(|_| HandshakeError::Timeout)?
             .map_err(HandshakeError::Connection)?;
         let ClientMessage::Hello(hello) = first else {
-            return Err(HandshakeError::Malformed);
+            return Err(HandshakeError::NotHello);
         };
         let server = PROTOCOL_VERSION;
         let reason = match hello.protocol.cmp(&server) {
@@ -198,10 +171,6 @@ impl<C: Connection> Session<C> {
         Ok((session, hello, outbox))
     }
 
-    /// Selects over the control lane, then audio, then the connection.
-    /// Ends when the connection fails or the control lane closes, which
-    /// happens when main drops the [`Outbox`]: a `Close` effect, or a
-    /// newer session for the same client taking its place.
     async fn run(mut self, events: &mpsc::UnboundedSender<SessionEvent>) {
         let ended = loop {
             tokio::select! {
@@ -225,28 +194,27 @@ impl<C: Connection> Session<C> {
                         Ok(message) => message,
                         Err(error) => break Some(error),
                     };
-                    if let ClientMessage::Logs(batch) = &message {
-                        debug!(
-                            "session {}: dropped {} log records, no telemetry store yet",
-                            self.id.0,
-                            batch.records.len()
-                        );
-                        continue;
-                    }
-                    if let ClientMessage::TimeSync(request) = &message {
-                        let reply = TimeSyncReply {
-                            client_sent: request.client_sent,
-                            server_received: received_at,
-                            server_sent: clock::now(),
-                        };
-                        if let Err(error) = self.conn.send(&ServerMessage::TimeSync(reply)).await {
-                            break Some(error);
+                    match &message {
+                        ClientMessage::Logs(batch) => {
+                            debug!(
+                                "session {}: dropped {} log records, no telemetry store yet",
+                                self.id.0,
+                                batch.records.len()
+                            );
                         }
+                        ClientMessage::TimeSync(request) => {
+                            let reply = TimeSyncReply {
+                                client_sent: request.client_sent,
+                                server_received: received_at,
+                                server_sent: clock::now(),
+                            };
+                            if let Err(error) = self.conn.send(&ServerMessage::TimeSync(reply)).await {
+                                break Some(error);
+                            }
+                            self.forward(events, message);
+                        }
+                        _ => self.forward(events, message),
                     }
-                    // TimeSync goes on too: any message refreshes the
-                    // hub's heartbeat.
-                    let client = self.client.clone();
-                    let _ = events.send(SessionEvent::Message { client, message });
                 }
             }
         };
@@ -259,6 +227,12 @@ impl<C: Connection> Session<C> {
             client: self.client,
             session: self.id,
         });
+    }
+
+    /// Any message refreshes the hub's heartbeat, a `TimeSync` included.
+    fn forward(&self, events: &mpsc::UnboundedSender<SessionEvent>, message: ClientMessage) {
+        let client = self.client.clone();
+        let _ = events.send(SessionEvent::Message { client, message });
     }
 }
 
@@ -291,7 +265,6 @@ mod tests {
         }
     }
 
-    /// The client's end of a [`FakeConn`].
     struct Peer {
         to_server: mpsc::UnboundedSender<ClientMessage>,
         from_server: mpsc::UnboundedReceiver<ServerMessage>,
@@ -345,7 +318,6 @@ mod tests {
         })
     }
 
-    /// A session that has said `Hello` and been opened as `session`.
     async fn opened(session: u64) -> (Peer, mpsc::UnboundedReceiver<SessionEvent>, Outbox) {
         let (conn, peer) = fake();
         let (events_tx, mut events) = mpsc::unbounded_channel();

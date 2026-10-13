@@ -1,5 +1,3 @@
-//! Runs the real `bounce-client` binary the way the verify harness does.
-
 use std::io::{ErrorKind, Read};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -12,7 +10,6 @@ use bounce_common::wire;
 
 const ID: &str = "b0c00000000000000000000000000001";
 
-/// Kills the client when the test ends, pass or fail.
 struct Running(Child);
 
 impl Drop for Running {

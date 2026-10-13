@@ -1,7 +1,4 @@
-//! Spotify Connect via librespot. librespot's `Sink` trait receives decoded
-//! packets; our sink forwards them to [`SourceOutput::pcm`] and opens and
-//! closes the stream around them. Track and volume events map onto
-//! [`SourceEvent`].
+//! Spotify Connect via librespot.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -226,8 +223,6 @@ fn device_id(name: &str) -> String {
     format!("{:x}", Sha1::digest(name.as_bytes()))
 }
 
-/// Playing, paused and stopped are left to the sink, which starts and stops
-/// the stream on the thread that writes its samples.
 fn map_event(event: PlayerEvent) -> Option<SourceEvent> {
     Some(match event {
         PlayerEvent::TrackChanged { audio_item } => SourceEvent::Track(track(*audio_item)),
@@ -276,9 +271,8 @@ fn to_spotify_volume(volume: Volume) -> u16 {
 /// sink has no device, so it sleeps to the same rate itself.
 const MAX_LEAD: Duration = Duration::from_millis(150);
 
-/// Each run of the sink is one stream. librespot calls `start` before the
-/// first `write` but sends its Playing event after, so a stream opened from
-/// the event loop would begin after its first samples.
+/// librespot sends player events over a channel from its player thread, so
+/// the event loop can hear one after the sink has written its samples.
 struct PacedSink {
     out: SourceOutput,
     since: Instant,
@@ -308,7 +302,7 @@ impl Sink for PacedSink {
     /// Called for a pause as well as a stop, with no way to tell them apart,
     /// so a pause ends the stream and the resume starts a new one.
     fn stop(&mut self) -> SinkResult<()> {
-        self.out.event(SourceEvent::Stopped);
+        self.out.stop_stream();
         Ok(())
     }
 

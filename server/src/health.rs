@@ -7,6 +7,7 @@ use std::mem::Discriminant;
 use std::time::{Duration, Instant};
 
 use bounce_common::ids::{ClientId, Version};
+use bounce_common::protocol::HEARTBEAT_TIMEOUT;
 
 use crate::fleet::ClientRecord;
 
@@ -69,7 +70,7 @@ pub struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            heartbeat_timeout: Duration::from_secs(15),
+            heartbeat_timeout: HEARTBEAT_TIMEOUT,
             offline_grace: Duration::from_mins(2),
             max_soc_millicelsius: 80_000,
             min_wifi_rssi_dbm: -75,

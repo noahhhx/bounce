@@ -1,11 +1,11 @@
-//! Staying connected to the server.
-
 use std::io;
 use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
 
-use bounce_common::protocol::{ClientMessage, Hello, RejectReason, ServerMessage};
+use bounce_common::protocol::{
+    ClientMessage, Hello, RejectReason, ServerMessage, HEARTBEAT_TIMEOUT,
+};
 use bounce_common::time::SinceBoot;
 use bounce_common::wire::WireError;
 use tracing::info;
@@ -30,14 +30,12 @@ enum LinkState<T> {
     },
 }
 
-/// Why a connection attempt or session ended. Every one leads to a backoff.
 #[derive(Debug)]
 enum Disconnect {
     Connect(io::Error),
     Wire(WireError),
     Rejected(RejectReason),
     NoReplyToHello,
-    /// The server must answer `Hello` with `Desired` or `Rejected`.
     UnexpectedFirstMessage,
     ServerSilent,
 }
@@ -51,18 +49,12 @@ impl From<WireError> for Disconnect {
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_secs(1);
 
-/// The server answers a `TimeSync` every second, so this much quiet means
-/// the path is gone even though the socket looks open, as when Wi-Fi drops
-/// without a FIN. Matches the server's own heartbeat timeout.
-const SERVER_SILENCE: Duration = Duration::from_secs(15);
-
 pub struct Link<C: Connector> {
     connector: C,
     server: SocketAddr,
     backoff: Backoff,
     hello: Hello,
     device: Device,
-    /// Failed attempts since the last successful handshake.
     failures: u32,
     jitter: XorShift,
     server_silence: Duration,
@@ -85,8 +77,6 @@ impl Default for Backoff {
 }
 
 impl Backoff {
-    /// The step doubles per failure up to `max`; the delay is uniform over
-    /// the upper half of the step, so no retry comes sooner than half of it.
     fn delay(&self, failures: u32, random: u64) -> Duration {
         let step = self
             .initial
@@ -98,7 +88,6 @@ impl Backoff {
     }
 }
 
-/// xorshift64, to spread retries without a dependency.
 struct XorShift(u64);
 
 impl XorShift {
@@ -113,8 +102,6 @@ impl XorShift {
 }
 
 impl<C: Connector> Link<C> {
-    /// Jitter is seeded from the boot id, which differs per client and per
-    /// start.
     pub fn new(
         connector: C,
         server: SocketAddr,
@@ -131,13 +118,10 @@ impl<C: Connector> Link<C> {
             device,
             failures: 0,
             jitter: XorShift(seed),
-            server_silence: SERVER_SILENCE,
+            server_silence: HEARTBEAT_TIMEOUT,
         }
     }
 
-    /// Runs forever on the calling thread. Every failure backs off and
-    /// reconnects with the same `Hello`, so the server sees a reconnect,
-    /// not a restart.
     pub fn run(mut self) -> ! {
         let mut state = LinkState::Connecting;
         loop {
@@ -259,8 +243,6 @@ mod tests {
         }
     }
 
-    /// Starts a link against a fresh listener on its own thread, which
-    /// outlives the test.
     fn start(configure: impl FnOnce(&mut Link<Tcp>) + Send + 'static) -> TcpListener {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let server = listener.local_addr().unwrap();
@@ -294,7 +276,6 @@ mod tests {
         }
     }
 
-    /// The fake server's end of one connection.
     struct Session(TcpStream);
 
     impl Session {
@@ -310,8 +291,6 @@ mod tests {
             self.0.write_all(&wire::encode(message).unwrap()).unwrap();
         }
 
-        /// Drains whatever the client still sends until it closes, for at
-        /// most [`PATIENCE`].
         fn is_closed_by_client(&mut self) -> bool {
             let deadline = Instant::now() + PATIENCE;
             let mut sink = [0; 256];
@@ -353,8 +332,6 @@ mod tests {
         let dropped = Instant::now();
 
         let mut second = accept(&listener);
-        // Well under the two ticks it takes a send to hit the dead socket,
-        // so the close itself was noticed.
         assert!(dropped.elapsed() < Duration::from_secs(1));
         assert_eq!(expect_hello(&mut second).boot, boot);
         second.send(&ServerMessage::Desired(desired(4)));

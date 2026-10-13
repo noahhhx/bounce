@@ -51,8 +51,6 @@ impl Listener for TcpListener {
 
     async fn accept(&mut self) -> io::Result<(TcpConnection, SocketAddr)> {
         let (stream, addr) = self.inner.accept().await?;
-        // Audio chunks are small and due on a deadline; Nagle would hold
-        // them back waiting for an ack.
         stream.set_nodelay(true)?;
         let conn = TcpConnection {
             stream,
@@ -63,7 +61,6 @@ impl Listener for TcpListener {
 }
 
 impl TcpConnection {
-    /// Takes one whole frame off the front of `read_buf`, if there is one.
     fn take_frame(&mut self) -> Result<Option<ClientMessage>, WireError> {
         let Some(prefix) = self.read_buf.first_chunk::<4>() else {
             return Ok(None);

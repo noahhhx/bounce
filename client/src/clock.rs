@@ -11,8 +11,7 @@ use bounce_common::time::{ClockOffset, ServerInstant, SinceBoot};
 
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 
-/// Time since the first call in this process, which `main` makes before
-/// anything else.
+/// Time since the first call in this process.
 #[must_use]
 pub fn now() -> SinceBoot {
     SinceBoot(ORIGIN.get_or_init(Instant::now).elapsed())
@@ -28,7 +27,6 @@ pub struct ClockSync {
     shared: SharedOffset,
 }
 
-/// At one sync a second, the last 16 seconds.
 const WINDOW: usize = 16;
 
 struct Sample {
@@ -78,9 +76,6 @@ impl ClockSync {
         TimeSyncRequest { client_sent: now }
     }
 
-    /// Forgets every sample. Each server process has its own clock origin,
-    /// so samples from an earlier connection may describe a different
-    /// clock.
     pub fn reset(&mut self) {
         self.samples.clear();
         self.shared.set(None);
@@ -149,8 +144,6 @@ mod tests {
 
     const OFFSET_US: u64 = 7_000_000;
 
-    /// A round trip starting at `sent_us` on the client clock, `up_us` to
-    /// reach the server, 100 µs inside it, and `down_us` back.
     fn round_trip(clock: &mut ClockSync, sent_us: u64, up_us: u64, down_us: u64) {
         let server_received = sent_us + up_us + OFFSET_US;
         let server_sent = server_received + 100;
@@ -170,8 +163,6 @@ mod tests {
         let mut clock = ClockSync::default();
         assert_eq!(clock.shared().get(), None);
 
-        // The slow trips are lopsided, so each alone would put the offset
-        // 1 ms and 4.5 ms off.
         round_trip(&mut clock, 1_000_000, 3_000, 1_000);
         round_trip(&mut clock, 2_000_000, 300, 300);
         round_trip(&mut clock, 3_000_000, 10_000, 1_000);

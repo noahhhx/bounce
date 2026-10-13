@@ -18,6 +18,7 @@ pub const MAX_FRAME_LEN: u32 = 1 << 20;
 pub enum WireError {
     Io(std::io::Error),
     FrameTooLarge(u32),
+    Encode(postcard::Error),
     Decode(postcard::Error),
     Closed,
 }
@@ -28,9 +29,7 @@ pub enum WireError {
 ///
 /// Only if the message encodes to more than [`MAX_FRAME_LEN`] bytes.
 pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, WireError> {
-    // Only a broken protocol type fails to serialize. `Decode` is the one
-    // variant that keeps the postcard error.
-    let body = postcard::to_allocvec(message).map_err(WireError::Decode)?;
+    let body = postcard::to_allocvec(message).map_err(WireError::Encode)?;
     let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
     if len > MAX_FRAME_LEN {
         return Err(WireError::FrameTooLarge(len));

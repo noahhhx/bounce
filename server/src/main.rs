@@ -27,8 +27,6 @@ use bounce_server::updates::ReleaseCatalog;
 /// Snapcast's default.
 const PLAYOUT_DELAY: Duration = Duration::from_secs(1);
 
-/// Where the hub's session effects go: each client's current session, and
-/// each source's broadcast task.
 #[derive(Default)]
 struct Routing {
     clients: HashMap<ClientId, Route>,
@@ -40,17 +38,12 @@ struct Route {
     outbox: Outbox,
 }
 
-/// What a source's broadcast task hears from main, besides its PCM.
 enum Subscription {
     Subscribe(ClientId, AudioLane),
     Unsubscribe(ClientId),
 }
 
 impl Routing {
-    /// Updates the table, then says what the hub should hear. An `Opened`
-    /// for a client that already has a route replaces it, and dropping the
-    /// old outbox ends the old session. A `Closed` removes only its own
-    /// session's route, since the client may already have reconnected.
     fn session_event(&mut self, event: SessionEvent) -> HubEvent {
         match event {
             SessionEvent::Opened {
@@ -82,8 +75,6 @@ impl Routing {
         }
     }
 
-    /// Dropping the outbox closes the control lane, which ends the session
-    /// even while a broadcaster still holds its audio lane.
     fn close(&mut self, client: &ClientId) {
         self.clients.remove(client);
     }

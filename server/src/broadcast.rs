@@ -1,8 +1,6 @@
 //! Turns one source's PCM into timestamped [`AudioChunk`]s and fans them
 //! out to every client in a zone routed to that source. One broadcaster per
-//! source is what keeps zones on the same source in sync. This is the hot
-//! path, so chunks go straight to each session's [`AudioLane`] and do not
-//! pass through the hub.
+//! source is what keeps zones on the same source in sync.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;

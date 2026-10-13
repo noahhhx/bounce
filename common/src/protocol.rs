@@ -25,6 +25,11 @@ use crate::zone::Volume;
 /// itself, so breaking them strands devices that are hard to reach.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// How long either end waits without hearing anything before it treats
+/// the session as dead. A Wi-Fi drop sends no FIN, so the socket alone
+/// cannot tell.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The mDNS service the server advertises and clients browse for. The SRV
 /// record carries the port.
 pub const MDNS_SERVICE: &str = "_bounce._tcp.local.";

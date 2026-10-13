@@ -152,14 +152,29 @@ impl TelemetryStore for MemoryStore {
     }
 
     fn query_logs(&self, query: &LogQuery) -> Vec<StoredLog> {
-        let mut matches: Vec<StoredLog> = query
+        // Each ring is already in arrival order. Wall times only merge the
+        // clients: a client's own wall times can step back when its clock
+        // estimate does.
+        let mut lanes: Vec<_> = query
             .clients
             .iter()
             .filter_map(|client| self.logs.get(client))
-            .flat_map(|logs| logs.records.iter().filter(|log| query.matches(log)))
-            .cloned()
+            .map(|logs| {
+                logs.records
+                    .iter()
+                    .filter(|log| query.matches(log))
+                    .peekable()
+            })
             .collect();
-        matches.sort_by_key(|log| log.wall);
+        let mut matches = Vec::new();
+        while let Some((_, lane)) = lanes
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, lane)| lane.peek().map(|log| (log.wall, i)))
+            .min()
+        {
+            matches.push(lanes[lane].next().expect("peeked").clone());
+        }
         matches.split_off(matches.len().saturating_sub(query.limit))
     }
 
@@ -383,6 +398,28 @@ mod tests {
             ..all(vec![c])
         };
         assert_eq!(stored(&store, &query), [(1, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn a_clients_records_keep_their_order_when_its_clock_estimate_moves_back() {
+        let mut store = store(100);
+        let (a, b) = (client(1), client(2));
+        store.append_logs(&a, batch(1, 1..=2), clock());
+        let behind = ClientClock {
+            wall: clock().wall - Duration::from_secs(5),
+            ..clock()
+        };
+        store.append_logs(&a, batch(1, 3..=3), behind);
+        store.append_logs(&b, batch(9, 1..=1), clock());
+
+        assert_eq!(
+            stored(&store, &all(vec![a.clone()])),
+            [(1, 1), (1, 2), (1, 3)]
+        );
+        let both = stored(&store, &all(vec![a, b]));
+        let a_only: Vec<_> = both.iter().filter(|(boot, _)| *boot == 1).collect();
+        assert_eq!(a_only, [&(1, 1), &(1, 2), &(1, 3)]);
+        assert_eq!(both.len(), 4);
     }
 
     #[tokio::test]

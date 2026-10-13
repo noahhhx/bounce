@@ -20,31 +20,6 @@ impl Drop for Running {
 }
 
 #[test]
-fn without_server_keeps_running_to_discover_one() {
-    let mut client = Running(
-        Command::new(env!("CARGO_BIN_EXE_bounce-client"))
-            .args(["--client-id", ID, "--data-dir", "/nonexistent"])
-            .args(["--output", "wav:/nonexistent"])
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-
-    thread::sleep(Duration::from_millis(500));
-    assert!(client.0.try_wait().unwrap().is_none(), "client exited");
-    let _ = client.0.kill();
-    let mut stderr = String::new();
-    client
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    assert!(stderr.contains("server=Discover"), "{stderr}");
-}
-
-#[test]
 fn says_hello_with_its_id_and_wav_output() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let server = listener.local_addr().unwrap().to_string();

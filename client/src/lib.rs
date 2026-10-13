@@ -24,6 +24,7 @@ pub mod telemetry;
 pub mod transport;
 pub mod updater;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bounce_common::protocol::{
@@ -34,6 +35,7 @@ use bounce_common::update::UpdateState;
 
 use crate::clock::ClockSync;
 use crate::player::{Output, OutputSettings, PlayerHandle, PlayerInput};
+use crate::telemetry::LogBuffer;
 
 /// Converges the device on the server's desired state and produces
 /// everything the server hears from it. The link feeds it messages and
@@ -45,14 +47,19 @@ pub struct Device {
     player: PlayerHandle,
     /// As last reported.
     player_state: PlayerState,
+    /// Never logs while holding this lock: the logging layer takes it too.
+    logs: Arc<Mutex<LogBuffer>>,
 }
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Records are truncated by the logging layer, so this many fit one frame.
+const MAX_LOG_BATCH: usize = 64;
+
 impl Device {
     /// Spawns the audio thread, which writes to `output`.
     #[must_use]
-    pub fn new(output: Output) -> Self {
+    pub fn new(output: Output, logs: Arc<Mutex<LogBuffer>>) -> Self {
         let clock = ClockSync::default();
         let player = PlayerHandle::spawn(clock.shared(), output);
         Self {
@@ -61,6 +68,7 @@ impl Device {
             next_sync: SinceBoot(Duration::ZERO),
             player,
             player_state: PlayerState::Idle,
+            logs,
         }
     }
 
@@ -72,6 +80,7 @@ impl Device {
     pub fn on_message(&mut self, message: ServerMessage, now: SinceBoot) -> Vec<ClientMessage> {
         match message {
             ServerMessage::Desired(desired) => {
+                telemetry::lock(&self.logs).set_level(desired.log_level);
                 self.converge(&desired);
                 self.desired = Some(desired);
                 if let Some(state) = self.player.state_change() {
@@ -87,17 +96,23 @@ impl Device {
                 self.player.send(PlayerInput::Chunk(chunk));
                 Vec::new()
             }
-            ServerMessage::Command(_)
-            | ServerMessage::LogsAck { .. }
-            | ServerMessage::Rejected(_) => {
+            ServerMessage::LogsAck { boot, up_to } => {
+                telemetry::lock(&self.logs).ack(boot, up_to);
+                Vec::new()
+            }
+            ServerMessage::Command(_) | ServerMessage::Rejected(_) => {
                 tracing::debug!(?message, "ignored");
                 Vec::new()
             }
         }
     }
 
-    /// Reports the player's state if it changed, and sends at most one
-    /// `TimeSync` per `SYNC_INTERVAL`, however often it is called.
+    /// Reports the player's state if it changed, sends at most one
+    /// `TimeSync` per `SYNC_INTERVAL`, however often it is called, and sends
+    /// unacked logs after it so the server can date them.
+    ///
+    /// Nothing here logs. A record about sending logs would itself need
+    /// sending on the next tick, forever.
     pub fn tick(&mut self, now: SinceBoot) -> Vec<ClientMessage> {
         let mut out = Vec::new();
         if let Some(state) = self.player.state_change() {
@@ -110,6 +125,8 @@ impl Device {
             self.next_sync = SinceBoot(now.0 + SYNC_INTERVAL);
             out.push(ClientMessage::TimeSync(self.clock.request(now)));
         }
+        let batch = telemetry::lock(&self.logs).batch(MAX_LOG_BATCH);
+        out.extend(batch.map(ClientMessage::Logs));
         out
     }
 
@@ -143,14 +160,16 @@ mod tests {
     use std::time::Instant;
 
     use bounce_common::audio::{AudioChunk, AudioFormat, Codec};
-    use bounce_common::ids::StreamId;
+    use bounce_common::ids::{BootId, StreamId};
     use bounce_common::protocol::{Revision, TimeSyncReply};
-    use bounce_common::telemetry::Level;
+    use bounce_common::telemetry::{Level, LogSeq};
     use bounce_common::time::ServerInstant;
     use bounce_common::zone::Volume;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::player::WavOutput;
+    use crate::telemetry::ForwardLayer;
 
     pub(crate) fn desired(revision: u64) -> DesiredState {
         DesiredState {
@@ -166,13 +185,98 @@ mod tests {
         }
     }
 
+    const BOOT: BootId = BootId(77);
+
+    pub(crate) fn logs() -> Arc<Mutex<LogBuffer>> {
+        Arc::new(Mutex::new(LogBuffer::new(BOOT, 16)))
+    }
+
     fn at(ms: u64) -> SinceBoot {
         SinceBoot(Duration::from_millis(ms))
     }
 
+    fn log_seqs(out: &[ClientMessage]) -> Option<Vec<u64>> {
+        out.iter().find_map(|m| match m {
+            ClientMessage::Logs(batch) => {
+                assert_eq!(batch.boot, BOOT);
+                Some(batch.records.iter().map(|r| r.seq.0).collect())
+            }
+            _ => None,
+        })
+    }
+
+    fn log(logs: &Mutex<LogBuffer>, level: Level) {
+        let at = at(0);
+        telemetry::lock(logs).push(at, level, "t".into(), "m".into(), Vec::new());
+    }
+
+    #[test]
+    fn tick_sends_unacked_logs_until_an_ack_for_this_boot() {
+        let logs = logs();
+        let mut device = Device::new(Output::Alsa, logs.clone());
+        log(&logs, Level::Info);
+        log(&logs, Level::Info);
+        assert_eq!(log_seqs(&device.tick(at(0))), Some(vec![1, 2]));
+        assert_eq!(log_seqs(&device.tick(at(1))), Some(vec![1, 2]));
+
+        let other_boot = ServerMessage::LogsAck {
+            boot: BootId(78),
+            up_to: LogSeq(2),
+        };
+        assert!(device.on_message(other_boot, at(2)).is_empty());
+        assert_eq!(log_seqs(&device.tick(at(3))), Some(vec![1, 2]));
+
+        let acked = ServerMessage::LogsAck {
+            boot: BOOT,
+            up_to: LogSeq(1),
+        };
+        device.on_message(acked, at(4));
+        assert_eq!(log_seqs(&device.tick(at(5))), Some(vec![2]));
+        log(&logs, Level::Info);
+        assert_eq!(log_seqs(&device.tick(at(6))), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn desired_sets_the_level_of_buffered_logs() {
+        let logs = logs();
+        let mut device = Device::new(Output::Alsa, logs.clone());
+        let quiet = DesiredState {
+            log_level: Level::Warn,
+            ..desired(1)
+        };
+        device.on_message(ServerMessage::Desired(quiet), at(0));
+        log(&logs, Level::Info);
+        assert_eq!(log_seqs(&device.tick(at(1))), None);
+        log(&logs, Level::Warn);
+        assert_eq!(log_seqs(&device.tick(at(2))), Some(vec![1]));
+    }
+
+    #[test]
+    fn sending_and_acking_logs_logs_nothing_more_to_send() {
+        let logs = logs();
+        let subscriber = tracing_subscriber::registry().with(ForwardLayer::new(logs.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut device = Device::new(Output::Alsa, logs.clone());
+            let verbose = DesiredState {
+                log_level: Level::Trace,
+                ..desired(1)
+            };
+            device.on_message(ServerMessage::Desired(verbose), at(0));
+            tracing::info!("one record");
+            let sent = device.tick(at(1));
+            let seqs = log_seqs(&sent).expect("the record is sent");
+            let up_to = LogSeq(*seqs.last().unwrap());
+            device.on_message(ServerMessage::LogsAck { boot: BOOT, up_to }, at(2));
+            for ms in [3, 1_003, 2_003] {
+                let out = device.tick(at(ms));
+                assert_eq!(log_seqs(&out), None, "{out:?}");
+            }
+        });
+    }
+
     #[test]
     fn desired_is_reported_applied_and_idle() {
-        let mut device = Device::new(Output::Alsa);
+        let mut device = Device::new(Output::Alsa, logs());
         let out = device.on_message(ServerMessage::Desired(desired(3)), at(0));
         assert!(
             matches!(
@@ -190,7 +294,7 @@ mod tests {
 
     #[test]
     fn tick_sends_at_most_one_time_sync_per_second() {
-        let mut device = Device::new(Output::Alsa);
+        let mut device = Device::new(Output::Alsa, logs());
         let syncs = |out: Vec<ClientMessage>| {
             out.iter()
                 .filter(|m| matches!(m, ClientMessage::TimeSync(_)))
@@ -231,10 +335,11 @@ mod tests {
     fn reports_buffering_then_playing_for_the_desired_stream_then_idle() {
         let dir = std::env::temp_dir().join(format!("bounce-device-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut device = Device::new(Output::Wav(WavOutput {
+        let output = Output::Wav(WavOutput {
             dir: dir.clone(),
             wall_origin_us: 0,
-        }));
+        });
+        let mut device = Device::new(output, logs());
         let now = clock::now();
         let server_now = ServerInstant(u64::try_from(now.0.as_micros()).unwrap());
         device.on_message(

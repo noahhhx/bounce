@@ -1,10 +1,12 @@
 use std::io::Read;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use bounce_client::clock;
 use bounce_client::config::{Config, OutputBackend};
 use bounce_client::link::{Backoff, Link};
 use bounce_client::player::{Output, WavOutput};
+use bounce_client::telemetry::{ForwardLayer, LogBuffer, LOG_CAPACITY};
 use bounce_client::transport::Tcp;
 use bounce_client::Device;
 use bounce_common::audio::Codec;
@@ -12,6 +14,10 @@ use bounce_common::ids::{BootId, Version};
 use bounce_common::protocol::{Hello, OutputDevice, PROTOCOL_VERSION};
 use bounce_common::update::Target;
 use tracing::info;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, Layer};
 
 #[cfg(target_arch = "aarch64")]
 const TARGET: Target = Target::Aarch64;
@@ -24,8 +30,12 @@ const TARGET: Target = Target::X86_64;
 
 fn main() -> ExitCode {
     let _ = clock::now();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+    let boot = boot_id();
+    let logs = Arc::new(Mutex::new(LogBuffer::new(boot, LOG_CAPACITY)));
+    let stderr = fmt::layer().with_writer(std::io::stderr);
+    tracing_subscriber::registry()
+        .with(stderr.with_filter(LevelFilter::INFO))
+        .with(ForwardLayer::new(logs.clone()))
         .init();
     let config = match Config::from_args(std::env::args().skip(1)) {
         Ok(config) => config,
@@ -36,7 +46,7 @@ fn main() -> ExitCode {
     };
     let server = config.server;
 
-    let hello = hello(&config);
+    let hello = hello(&config, boot);
     info!(client = ?hello.client, boot = hello.boot.0, ?server, "starting");
     let output = match config.output {
         OutputBackend::Alsa => Output::Alsa,
@@ -45,10 +55,11 @@ fn main() -> ExitCode {
             wall_origin_us: clock::wall_origin_micros(),
         }),
     };
-    Link::new(Tcp, server, Backoff::default(), hello, Device::new(output)).run()
+    let device = Device::new(output, logs);
+    Link::new(Tcp, server, Backoff::default(), hello, device).run()
 }
 
-fn hello(config: &Config) -> Hello {
+fn hello(config: &Config, boot: BootId) -> Hello {
     let output = match &config.output {
         OutputBackend::Alsa => OutputDevice {
             id: "default".into(),
@@ -62,7 +73,7 @@ fn hello(config: &Config) -> Hello {
     Hello {
         protocol: PROTOCOL_VERSION,
         client: config.client_id.clone(),
-        boot: boot_id(),
+        boot,
         version: Version {
             major: version_part(env!("CARGO_PKG_VERSION_MAJOR")),
             minor: version_part(env!("CARGO_PKG_VERSION_MINOR")),

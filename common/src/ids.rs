@@ -10,7 +10,8 @@ impl ClientId {
     /// Accepts the 32 lowercase hex characters `/etc/machine-id` contains.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
-        todo!()
+        let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        (raw.len() == 32 && raw.bytes().all(hex)).then(|| Self(raw.to_owned()))
     }
 }
 
@@ -44,4 +45,23 @@ pub struct Version {
     pub major: u16,
     pub minor: u16,
     pub patch: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_id_is_32_lowercase_hex() {
+        assert!(ClientId::parse("b0c00000000000000000000000000001").is_some());
+        for bad in [
+            "",
+            "b0c0000000000000000000000000001",
+            "b0c000000000000000000000000000001",
+            "B0C00000000000000000000000000001",
+            "g0c00000000000000000000000000001",
+        ] {
+            assert!(ClientId::parse(bad).is_none(), "{bad:?} accepted");
+        }
+    }
 }

@@ -44,14 +44,15 @@ change.
 
 **Current status (2026-10-13).** `$B up --clients 2` gives a healthy
 doctor. Clients connect, converge on their desired state, stay online, and
-reconnect by themselves. Every step of [join](features/join.md) passes
-except the last part of a server restart: the server does not persist its
-fleet yet, so a client that is off during the restart is not listed
-afterwards. Routing a zone sends its clients `Playing` and subscribes them
-to the source's audio, but the client has no player yet. It reports
-`player=Idle` and writes no WAVs, so `$B peak` and `$B sync` have nothing
-to measure, and the audio steps of [sync](features/sync.md) and
-[volume](features/volume.md) cannot pass yet.
+reconnect by themselves. Every step of [join](features/join.md),
+[zones](features/zones.md), [volume](features/volume.md),
+[sync](features/sync.md) and [logs](features/logs.md) passes. The server
+keeps its fleet and zones in `<data-dir>/fleet.json`, so a client that is
+off during a restart is listed offline. Same-zone `sync` spreads read
+9 to 35 µs. The client's ALSA output is not built: with `--output alsa` the
+player reports `OutputUnavailable`. mDNS discovery works over loopback, but
+the harness always passes `--no-mdns` and `--server`, so it does not cover
+discovery.
 
 ## Launch
 

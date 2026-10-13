@@ -80,7 +80,7 @@ impl Broadcaster {
     /// right where the previous one ends, so uneven arrivals stay gapless.
     /// The timeline restarts at `now + playout_delay` on the first chunk and
     /// whenever the source drifts more than [`MAX_SLIP`] from it, as after
-    /// a pause. A subscriber whose outbox is full gets dropped chunks,
+    /// a stall. A subscriber whose outbox is full gets dropped chunks,
     /// never backpressure, so one slow client can't stall a room. Samples
     /// before the first [`Broadcaster::start`] have no format and are
     /// dropped.

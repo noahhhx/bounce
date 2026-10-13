@@ -1,6 +1,7 @@
 //! Spotify Connect via librespot. librespot's `Sink` trait receives decoded
-//! packets; our sink forwards them to [`SourceOutput::pcm`]. Its player
-//! events map onto [`SourceEvent`].
+//! packets; our sink forwards them to [`SourceOutput::pcm`] and opens and
+//! closes the stream around them. Track and volume events map onto
+//! [`SourceEvent`].
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -166,7 +167,6 @@ async fn run(
 
     let mut spirc: Option<(Spirc, SpircTask)> = None;
     let mut pending = cache.credentials();
-    let mut started = false;
     loop {
         if let Some(credentials) = pending.take() {
             if let Some((old, old_task)) = spirc.take() {
@@ -203,7 +203,7 @@ async fn run(
             },
             Some(event) = player_events.recv() => {
                 if let Some(event) = map_event(event) {
-                    forward(&out, &mut started, event);
+                    out.event(event);
                 }
             }
             () = async { if let Some((_, task)) = &mut spirc { task.await } }, if spirc.is_some() => {
@@ -226,30 +226,11 @@ fn device_id(name: &str) -> String {
     format!("{:x}", Sha1::digest(name.as_bytes()))
 }
 
-/// Announces the format before the first playback event, and again after a
-/// stop, so the hub learns the format before it hears about a track. Sent
-/// from here rather than the sink so it stays ordered with the other events.
-fn forward(out: &SourceOutput, started: &mut bool, event: SourceEvent) {
-    match event {
-        SourceEvent::Stopped => *started = false,
-        SourceEvent::VolumeChanged(_) => {}
-        _ if !*started => {
-            *started = true;
-            out.start_stream(SAMPLE_RATE, NUM_CHANNELS);
-        }
-        _ => {}
-    }
-    out.event(event);
-}
-
+/// Playing, paused and stopped are left to the sink, which starts and stops
+/// the stream on the thread that writes its samples.
 fn map_event(event: PlayerEvent) -> Option<SourceEvent> {
     Some(match event {
         PlayerEvent::TrackChanged { audio_item } => SourceEvent::Track(track(*audio_item)),
-        PlayerEvent::Playing { .. } => SourceEvent::Resumed,
-        PlayerEvent::Paused { .. } => SourceEvent::Paused,
-        // Spirc answers an end of track with the next one, or with a stop
-        // when the queue is empty, so EndOfTrack itself needs no mapping.
-        PlayerEvent::Stopped { .. } => SourceEvent::Stopped,
         PlayerEvent::VolumeChanged { volume } => {
             SourceEvent::VolumeChanged(from_spotify_volume(volume))
         }
@@ -295,6 +276,9 @@ fn to_spotify_volume(volume: Volume) -> u16 {
 /// sink has no device, so it sleeps to the same rate itself.
 const MAX_LEAD: Duration = Duration::from_millis(150);
 
+/// Each run of the sink is one stream. librespot calls `start` before the
+/// first `write` but sends its Playing event after, so a stream opened from
+/// the event loop would begin after its first samples.
 struct PacedSink {
     out: SourceOutput,
     since: Instant,
@@ -317,6 +301,14 @@ impl Sink for PacedSink {
     fn start(&mut self) -> SinkResult<()> {
         self.since = Instant::now();
         self.written = Duration::ZERO;
+        self.out.start_stream(SAMPLE_RATE, NUM_CHANNELS);
+        Ok(())
+    }
+
+    /// Called for a pause as well as a stop, with no way to tell them apart,
+    /// so a pause ends the stream and the resume starts a new one.
+    fn stop(&mut self) -> SinkResult<()> {
+        self.out.event(SourceEvent::Stopped);
         Ok(())
     }
 
@@ -341,6 +333,7 @@ mod tests {
     use bounce_common::ids::SourceId;
 
     use super::*;
+    use crate::hub::HubEvent;
     use crate::source::Pcm;
 
     #[test]
@@ -372,11 +365,52 @@ mod tests {
             real_time.contains(&after_pause),
             "second after a pause took {after_pause:?}"
         );
-        let mut samples = 0;
-        while let Ok(Pcm::Samples(chunk)) = received.try_recv() {
-            samples += chunk.len();
-        }
+        let samples: usize = std::iter::from_fn(|| received.try_recv().ok())
+            .map(|pcm| match pcm {
+                Pcm::Start { .. } => 0,
+                Pcm::Samples(chunk) => chunk.len(),
+            })
+            .sum();
         assert_eq!(samples, 2 * 2 * 44_100);
+    }
+
+    #[test]
+    fn each_sink_run_is_a_stream_that_starts_before_its_samples() {
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (pcm, mut pcm_rx) = mpsc::unbounded_channel();
+        let streams = Arc::new(AtomicU64::new(7));
+        let mut sink = PacedSink::new(SourceOutput::new(SourceId(0), events, pcm, streams));
+        let mut converter = Converter::new(None);
+
+        sink.start().unwrap();
+        sink.write(AudioPacket::Samples(vec![0.25; 2]), &mut converter)
+            .unwrap();
+        sink.stop().unwrap();
+        sink.start().unwrap();
+        sink.write(AudioPacket::Samples(vec![0.25; 2]), &mut converter)
+            .unwrap();
+
+        let pcm: Vec<String> = std::iter::from_fn(|| pcm_rx.try_recv().ok())
+            .map(|pcm| match pcm {
+                Pcm::Start { stream, .. } => format!("start {}", stream.0),
+                Pcm::Samples(_) => "samples".to_owned(),
+            })
+            .collect();
+        assert_eq!(pcm, ["start 7", "samples", "start 8", "samples"]);
+        let events: Vec<String> = std::iter::from_fn(|| events_rx.try_recv().ok())
+            .map(|event| match event {
+                HubEvent::Source {
+                    event: SourceEvent::Started { stream, .. },
+                    ..
+                } => format!("started {}", stream.0),
+                HubEvent::Source {
+                    event: SourceEvent::Stopped,
+                    ..
+                } => "stopped".to_owned(),
+                _ => "other".to_owned(),
+            })
+            .collect();
+        assert_eq!(events, ["started 7", "stopped", "started 8"]);
     }
 
     #[test]

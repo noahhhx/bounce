@@ -44,6 +44,9 @@ pub struct SourceState {
     /// The casting app's volume slider. A client's output volume is this
     /// scaled by its zone's volume.
     pub volume: Volume,
+    /// The source's, not the stream's: a track outlives a pause, and can be
+    /// announced before the stream that plays it starts.
+    pub track: Option<TrackMetadata>,
     pub playback: SourcePlayback,
 }
 
@@ -52,8 +55,6 @@ pub enum SourcePlayback {
     Active {
         stream: StreamId,
         format: AudioFormat,
-        paused: bool,
-        track: Option<TrackMetadata>,
     },
 }
 
@@ -163,6 +164,7 @@ impl Hub {
                     kind,
                     name,
                     volume: Volume::new(100),
+                    track: None,
                     playback: SourcePlayback::Idle,
                 };
                 (id, state)
@@ -252,26 +254,13 @@ impl Hub {
         let Some(state) = self.sources.get_mut(&source) else {
             return warn!("event from unknown source {source:?}");
         };
-        match (event, &mut state.playback) {
-            (SourceEvent::Started { stream, format }, playback) => {
-                *playback = SourcePlayback::Active {
-                    stream,
-                    format,
-                    paused: false,
-                    track: None,
-                };
+        match event {
+            SourceEvent::Started { stream, format } => {
+                state.playback = SourcePlayback::Active { stream, format };
             }
-            (SourceEvent::Track(metadata), SourcePlayback::Active { track, .. }) => {
-                *track = Some(metadata);
-            }
-            (SourceEvent::Paused, SourcePlayback::Active { paused, .. }) => *paused = true,
-            (SourceEvent::Resumed, SourcePlayback::Active { paused, .. }) => *paused = false,
-            (
-                SourceEvent::Track(_) | SourceEvent::Paused | SourceEvent::Resumed,
-                SourcePlayback::Idle,
-            ) => {}
-            (SourceEvent::Stopped, playback) => *playback = SourcePlayback::Idle,
-            (SourceEvent::VolumeChanged(volume), _) => state.volume = volume,
+            SourceEvent::Track(track) => state.track = Some(track),
+            SourceEvent::Stopped => state.playback = SourcePlayback::Idle,
+            SourceEvent::VolumeChanged(volume) => state.volume = volume,
         }
     }
 
@@ -498,9 +487,8 @@ impl Hub {
             }
             _ => 0,
         };
-        // A pause is a gap in the same stream, so it stays Playing.
         let playback = match source.map(|s| &s.playback) {
-            Some(&SourcePlayback::Active { stream, format, .. }) => {
+            Some(&SourcePlayback::Active { stream, format }) => {
                 Playback::Playing { stream, format }
             }
             _ => Playback::Idle,
@@ -679,6 +667,32 @@ mod tests {
             }
         );
         assert_eq!(subscription_changes(&effects), []);
+    }
+
+    #[test]
+    fn a_track_announced_before_its_stream_starts_is_kept() {
+        let t0 = Instant::now();
+        let mut hub = hub();
+        let track = TrackMetadata {
+            title: "Teardrop".to_owned(),
+            artists: vec!["Massive Attack".to_owned()],
+            album: "Mezzanine".to_owned(),
+            cover_url: None,
+            duration: Duration::from_secs(330),
+        };
+        let event = HubEvent::Source {
+            source: TONE,
+            event: SourceEvent::Track(track),
+        };
+        hub.handle(event, t0);
+        start_tone(&mut hub, t0);
+
+        let state = &hub.sources[&TONE];
+        assert_eq!(
+            state.track.as_ref().map(|t| t.title.as_str()),
+            Some("Teardrop")
+        );
+        assert!(matches!(state.playback, SourcePlayback::Active { .. }));
     }
 
     #[test]

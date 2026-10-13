@@ -129,14 +129,14 @@ impl SourceOutput {
 #[derive(Debug, Clone)]
 pub enum SourceEvent {
     /// Sources call [`SourceOutput::start_stream`] rather than building
-    /// this, so the broadcaster always hears of the stream too.
+    /// this, so the broadcaster always hears of the stream too. Send it and
+    /// [`SourceEvent::Stopped`] from the thread that writes the samples, so
+    /// the hub hears them in the order the streams ran.
     Started {
         stream: StreamId,
         format: AudioFormat,
     },
     Track(TrackMetadata),
-    Paused,
-    Resumed,
     Stopped,
     /// The user moved the volume slider in the casting app. This is the
     /// source's master volume, scaled by each zone's own volume.

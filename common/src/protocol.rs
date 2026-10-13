@@ -130,7 +130,7 @@ pub struct ReportedState {
     pub update: UpdateState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlayerState {
     Idle,
     Buffering { stream: StreamId },

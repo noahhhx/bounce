@@ -1,0 +1,67 @@
+site_name: Bounce
+site_description: Self-hosted, whole-home audio broadcasting.
+site_url: https://noahhhx.github.io/bounce/
+repo_url: https://github.com/noahhhx/bounce
+repo_name: noahhhx/bounce
+edit_uri: edit/main/docs/
+exclude_docs: requirements.txt
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.indexes
+    - navigation.sections
+    - navigation.footer
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - toc:
+      permalink: true
+
+validation:
+  links:
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: index.md
+  - Setup:
+      - setup/index.md
+      - Run the server: setup/server.md
+      - Add a speaker: setup/speakers.md
+      - Build a Raspberry Pi speaker: setup/raspberry-pi.md
+  - Features:
+      - features/index.md
+      - Spotify Connect: features/spotify.md
+      - Zones: features/zones.md
+      - Volume: features/volume.md
+      - Multi-room sync: features/sync.md
+      - Speaker logs: features/logs.md
+      - Web UI: features/web-ui.md
+      - Speaker updates: features/updates.md
+  - Reference:
+      - Server command line: reference/server.md
+      - Speaker command line: reference/client.md
+      - HTTP API: reference/http-api.md

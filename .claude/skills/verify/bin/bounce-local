@@ -143,7 +143,10 @@ cmd_doctor() {
     if [[ $PREBUILT == 1 ]]; then
       echo "build    prebuilt binaries from $BIN; staleness not checked"
     else
-      newest=$(find "$REPO"/{common,server,client} -name '*.rs' -newer "$BIN/bounce-server" -print -quit)
+      newest=$({
+        find "$REPO"/{common,server} -name '*.rs' -newer "$BIN/bounce-server" -print -quit
+        find "$REPO"/{common,client} -name '*.rs' -newer "$BIN/bounce-client" -print -quit
+      } | head -1)
       [[ -z $newest ]] && echo "build    current" || { ok=0; echo "build    STALE: $newest is newer than the binaries; rerun up"; }
     fi
     local addr

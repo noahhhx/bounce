@@ -17,6 +17,15 @@
     ];
   };
 
+  # https://devenv.sh/languages/python/
+  languages.python = {
+    enable = true;
+    venv = {
+      enable = true;
+      requirements = builtins.readFile ./docs/requirements.txt;
+    };
+  };
+
   # https://devenv.sh/scripts/
   scripts.hello.exec = "echo hello from devenv";
 

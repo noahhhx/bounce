@@ -5,3 +5,4 @@ description = "Audio player for speaker-attached devices, receives the broadcast
 
 [dependencies]
 bounce-common = { path = "../common" }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }

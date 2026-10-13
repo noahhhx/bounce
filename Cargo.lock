@@ -181,6 +181,7 @@ name = "bounce-client"
 version = "0.0.0"
 dependencies = [
  "bounce-common",
+ "tracing",
 ]
 
 [[package]]

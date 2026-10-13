@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -158,12 +160,14 @@ async fn main() {
     );
     let (state, state_rx) = watch::channel(hub.view());
     let telemetry = Telemetry::spawn(MemoryStore::new(Retention::default()));
-    let api = http::serve(http_listener, events_tx.clone(), state_rx, releases);
-    tokio::spawn(async move {
-        let Err(error) = api.await;
-        eprintln!("bounce-server: http: {error}");
-        std::process::exit(1);
-    });
+    let api = http::serve(
+        http_listener,
+        events_tx.clone(),
+        state_rx,
+        releases,
+        telemetry.clone(),
+    );
+    tokio::spawn(exit_when_stopped(api));
     let (sessions_tx, mut sessions) = mpsc::unbounded_channel();
     tokio::spawn(session::accept(
         transport::TcpListener::from(session_listener),
@@ -219,6 +223,12 @@ fn advertise(session: SocketAddr) -> Option<ServiceDaemon> {
             None
         }
     }
+}
+
+async fn exit_when_stopped(api: impl std::future::Future<Output = io::Result<Infallible>>) {
+    let Err(error) = api.await;
+    eprintln!("bounce-server: http: {error}");
+    std::process::exit(1);
 }
 
 async fn stop(mut sources: HashMap<SourceId, Box<dyn Source>>) {

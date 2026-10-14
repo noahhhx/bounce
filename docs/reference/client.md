@@ -15,5 +15,5 @@ bounce-client [--client-id <id>] [--server <addr>] [--data-dir <path>] [--output
 
 | Spec | Output |
 |---|---|
-| `alsa` | The device's sound card. Not available yet. The speaker reports `OutputUnavailable`. |
+| `alsa` | The device's sound card, through ALSA. The speaker offers the server its playback devices, and the server picks the first one, `default`. If the device is missing or busy, the speaker reports `OutputUnavailable` and tries again every 2 seconds. Linux only. |
 | `wav:<dir>` | WAV files in `<dir>`, one per stream, named `stream-<id>.wav`. Each WAV file has a `stream-<id>.timing` file next to it with the time each chunk would play. |

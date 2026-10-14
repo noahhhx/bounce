@@ -20,7 +20,9 @@ pub enum Server {
 
 /// `--output alsa` (default) or `--output wav:<dir>`.
 pub enum OutputBackend {
-    /// Advertises the device's ALSA playback devices in `Hello`.
+    /// Advertises the device's ALSA playback devices in `Hello`, `default`
+    /// first, and plays through the one the server picks. See
+    /// [`crate::player::Output`]. Linux only: other builds exit with code 2.
     Alsa,
     /// Advertises one output, `wav`, and writes what would have reached
     /// the DAC into `dir`. See [`crate::player::WavOutput`].

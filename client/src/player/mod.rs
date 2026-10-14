@@ -1,5 +1,7 @@
-//! The audio thread: hold chunks until their deadline, then write them to
-//! the output.
+//! The audio thread: hold chunks until their deadline and hand them to the
+//! output so each is heard on time. A WAV file is written at the deadline.
+//! A sound card is kept [`WRITE_AHEAD`] ahead, and its crystal's drift
+//! from the local clock is corrected one frame at a time.
 
 #[cfg(target_os = "linux")]
 mod alsa_output;

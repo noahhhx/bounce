@@ -3,15 +3,18 @@
 Each speaker runs `bounce-client`. The client finds the server, joins it,
 and plays what the server sends.
 
-!!! warning "No sound card output yet"
-    The client cannot play through a sound card yet. With the default
-    `--output alsa`, the speaker joins the server and reports
-    `OutputUnavailable`. To check that a speaker receives audio, write it
-    to WAV files with `--output wav:<dir>`.
+!!! warning "Sound card output is new"
+    The client plays through the ALSA `default` device, but it has not
+    been tested on a Raspberry Pi yet. Speakers with different sound cards
+    can play slightly out of sync, because the server cannot set each
+    speaker's output latency yet. To check what a speaker receives, write
+    it to WAV files with `--output wav:<dir>`.
 
 ## Build the client
 
-On the speaker device, or on a machine that builds for it, run:
+The client links against ALSA, so the build needs the ALSA development
+files and `pkg-config`, for example `libasound2-dev` on Debian. On the
+speaker device, or on a machine that builds for it, run:
 
 ```sh
 cargo build --release -p bounce-client
@@ -26,7 +29,7 @@ most Linux systems already have. The client also stores its state in
 `/var/lib/bounce` by default.
 
 ```sh
-target/release/bounce-client --data-dir ~/.local/share/bounce-client --output wav:/tmp/bounce-wav
+target/release/bounce-client --data-dir ~/.local/share/bounce-client
 ```
 
 The client looks for the server with mDNS. If mDNS does not work on your

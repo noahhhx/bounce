@@ -24,9 +24,9 @@ Bounce has three parts:
   Until it is, you control Bounce through the [HTTP API](reference/http-api.md).
 
 !!! warning "Early development"
-    Bounce is not ready for everyday listening. Speakers cannot play
-    through a sound card yet. They can only write the audio they receive to
-    WAV files. Pages for features that do not exist yet are marked
+    Bounce is not ready for everyday listening. Speakers play through
+    their sound card, but this has not been tested on a Raspberry Pi yet.
+    Pages for features that do not exist yet are marked
     **Not available yet**.
 
 ## Next steps

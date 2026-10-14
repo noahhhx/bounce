@@ -120,21 +120,28 @@ struct Lead {
     /// With no chunk due, write silence only once the device would run dry
     /// within this, since a chunk may still arrive in time.
     pad_within: Duration,
-    /// How far the cursor may fall behind `now` before the lost time is
-    /// skipped in silence. A clocked device reports that as an underrun.
-    max_behind: Option<Duration>,
+    /// How far the cursor may fall behind `now` before the time is lost,
+    /// and counted as an underrun.
+    max_behind: Duration,
+    /// The soonest the walk asks to run again.
+    min_wake: Duration,
 }
 
 impl Lead {
     const WRITTEN: Self = Self {
         fill_to: Duration::ZERO,
         pad_within: Duration::ZERO,
-        max_behind: Some(MAX_BEHIND),
+        max_behind: MAX_BEHIND,
+        min_wake: Duration::ZERO,
     };
+    /// `PipeWire` was measured running dry without an error, so content that
+    /// should already be playing means the device starved. A device that
+    /// is not draining would otherwise wake the walk continuously.
     const DEVICE: Self = Self {
         fill_to: WRITE_AHEAD,
         pad_within: Duration::from_millis(15),
-        max_behind: None,
+        max_behind: Duration::ZERO,
+        min_wake: Duration::from_millis(5),
     };
 }
 
@@ -435,8 +442,7 @@ impl<O: Output> Player<O> {
         }
     }
 
-    /// An underrun leaves the device empty, so the next step starts it again
-    /// from `now`.
+    /// After an underrun content resumes where the device is now.
     fn failed(
         &mut self,
         mut track: Track<O::Sink>,
@@ -449,9 +455,13 @@ impl<O: Output> Player<O> {
                 track.drift = DeviceClock::new(track.wanted.format.sample_rate);
                 let state = if playing {
                     self.counters.underruns.fetch_add(1, Ordering::Relaxed);
+                    let cursor = match track.sink.clock(now) {
+                        Ok(Clock::Device { queued }) => after(now, queued),
+                        _ => now,
+                    };
                     State::Playing {
                         track,
-                        cursor: now,
+                        cursor,
                         refilling: true,
                     }
                 } else {
@@ -492,17 +502,19 @@ impl<O: Output> Player<O> {
                 (Lead::DEVICE, SinceBoot(cursor.0.saturating_sub(queued)))
             }
         };
-        if let Some(max_behind) = lead.max_behind {
-            if now > after(*cursor, max_behind) {
-                let frames = frames_in(now.0.saturating_sub(cursor.0), rate);
-                track.write(Frames::Silence { frames })?;
-                self.counters.underruns.fetch_add(1, Ordering::Relaxed);
-                *cursor = now;
+        if !priming && now > after(*cursor, lead.max_behind) {
+            if clock != Clock::Written {
+                return Err(SinkError::Underrun);
             }
+            let frames = frames_in(now.0.saturating_sub(cursor.0), rate);
+            track.write(Frames::Silence { frames })?;
+            self.counters.underruns.fetch_add(1, Ordering::Relaxed);
+            *cursor = now;
         }
         let mut heard = false;
         let wake_at = |cursor: SinceBoot, ahead: Duration| {
-            SinceBoot(now.0 + cursor.0.saturating_sub(horizon.0).saturating_sub(ahead))
+            let due = cursor.0.saturating_sub(horizon.0).saturating_sub(ahead);
+            SinceBoot(now.0 + due.max(lead.min_wake))
         };
         loop {
             if *cursor > after(horizon, lead.fill_to) {
@@ -1280,25 +1292,44 @@ mod tests {
 
         #[test]
         fn a_stalled_thread_counts_one_underrun_and_resumes_on_the_deadlines() {
-            let mut rig = dac_rig(Dac::default(), 1_000);
-            rig.run_until(3_000);
-            let before = rig.heard().len();
-            rig.stall_until(3_305);
-            rig.run_until(5_000);
+            for silent_underruns in [false, true] {
+                let dac = Dac {
+                    silent_underruns,
+                    ..Dac::default()
+                };
+                let mut rig = dac_rig(dac, 1_000);
+                rig.run_until(3_000);
+                let before = rig.heard().len();
+                rig.stall_until(3_305);
+                rig.run_until(5_000);
 
-            assert_eq!(rig.counter(|c| &c.underruns), 1);
-            let resumed = &rig.heard()[before..];
-            assert_eq!(
-                resumed[0].play_at,
-                ServerInstant(3_310_000),
-                "playback resumes on the first chunk still in the future"
-            );
-            assert!(worst(resumed) < 1_000, "off by {} µs", worst(resumed));
-            assert!(
-                rig.counter(|c| &c.late_chunks) > 0,
-                "chunks due in the stall are dropped"
-            );
-            assert_eq!(rig.states(), [buffering(), playing()], "stays Playing");
+                let mode = if silent_underruns {
+                    "silent"
+                } else {
+                    "reported"
+                };
+                assert_eq!(rig.counter(|c| &c.underruns), 1, "{mode} underrun");
+                let resumed = &rig.heard()[before..];
+                assert_eq!(
+                    resumed[0].play_at,
+                    ServerInstant(3_310_000),
+                    "{mode}: playback resumes on the first chunk still in the future"
+                );
+                assert!(
+                    worst(resumed) < 1_000,
+                    "{mode}: off by {} µs",
+                    worst(resumed)
+                );
+                assert!(
+                    rig.counter(|c| &c.late_chunks) > 0,
+                    "{mode}: chunks due in the stall are dropped"
+                );
+                assert_eq!(
+                    rig.states(),
+                    [buffering(), playing()],
+                    "{mode}: stays Playing"
+                );
+            }
         }
 
         #[test]

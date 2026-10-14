@@ -51,6 +51,8 @@ pub struct Dac {
     /// The hardware pointer moves in steps of this many frames, so `delay`
     /// reads stale and high in between. 0 or 1 is exact.
     pub quantum: u64,
+    /// Runs dry without reporting it, as `PipeWire` was measured doing.
+    pub silent_underruns: bool,
     pub busy: bool,
     pub unplugged: bool,
     pub heard: Vec<Heard>,
@@ -181,7 +183,9 @@ impl Sink for FakeSink {
         if let Some(run) = dac.run {
             if dac.consumed(run, now) > dac.written {
                 dac.run = None;
-                return Err(SinkError::Underrun);
+                if !dac.silent_underruns {
+                    return Err(SinkError::Underrun);
+                }
             }
         }
         let queued = dac.duration(dac.queued());

@@ -42,16 +42,17 @@ change.
   `stream-<id>.timing` (`<first frame> <play_at us> <wall us>` per chunk,
   where `wall us` is when that frame plays on the host wall clock).
 
-**Current status (2026-10-13).** `$B up --clients 2` gives a healthy
+**Current status (2026-10-14).** `$B up --clients 2` gives a healthy
 doctor. Clients connect, converge on their desired state, stay online, and
 reconnect by themselves. Every step of [join](features/join.md),
 [zones](features/zones.md), [volume](features/volume.md),
 [sync](features/sync.md) and [logs](features/logs.md) passes. The server
 keeps its fleet and zones in `<data-dir>/fleet.json`, so a client that is
 off during a restart is listed offline. Same-zone `sync` spreads read
-9 to 35 µs. The client's ALSA output is not built: with `--output alsa` the
-player reports `OutputUnavailable`. mDNS discovery works over loopback, but
-the harness always passes `--no-mdns` and `--server`, so it does not cover
+9 to 35 µs. With `--output alsa` a client plays through this host's card,
+and two such clients stay within 0.3 ms of each other once they settle
+([sound card output](features/sound-card.md)). mDNS discovery works over
+loopback, but the harness always passes `--no-mdns` and `--server`, so it does not cover
 discovery.
 
 ## Launch
@@ -174,9 +175,10 @@ Proof standards:
   with `peak` or `sync`.
 - Know what this setup cannot prove. The WAV sink replaces ALSA, and
   loopback has no Wi-Fi loss or jitter. A local pass proves protocol,
-  scheduling, convergence and audio content. It does not prove DAC timing,
-  ALSA device handling, or behavior on a lossy network. Say so when you
-  report a result.
+  scheduling, convergence and audio content. It does not prove DAC timing
+  or behavior on a lossy network. [Sound card output](features/sound-card.md)
+  covers ALSA through this host's card, but not a Pi's DAC or two separate
+  cards. Say so when you report a result.
 
 ## Cleanup
 

@@ -37,7 +37,7 @@ as the recipe.
 - Record which feature ID each artifact proves.
 - If a step cannot run, report the command and the unmet precondition.
   Do not report a step as verified because a different step passed.
-- State what a local run cannot cover (ALSA, DAC timing, a lossy network)
+- State what a local run cannot cover (a Pi's DAC, separate sound cards, a lossy network)
   whenever it matters to the claim.
 
 ## Feature entry contract
@@ -58,3 +58,4 @@ user-visible behavior. It then has exactly four H2 sections, in this order.
 - [Volume](./volume.md) covers zone volume, source volume, and how they reach each speaker's output.
 - [Multi-room sync](./sync.md) covers speakers in zones on the same source playing the same audio at the same moment.
 - [Client logs](./logs.md) covers a speaker's log records reaching the server, surviving a server outage, and never arriving twice.
+- [Sound card output](./sound-card.md) covers a speaker playing through ALSA, staying aligned with another sound-card speaker, and recovering from a busy device.

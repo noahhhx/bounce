@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Usage: alsa-pair <secs> [freeze_at_s freeze_ms]
+#
+# Starts a fresh run with no WAV clients, then two real `--output alsa`
+# clients on this host's default ALSA device, in one zone, playing the test
+# tone at volume 40. Records the PipeWire default sink's monitor for <secs>
+# and prints, for every test-tone click, how far apart the two clients'
+# clicks landed in the mix. With freeze_at_s, client 2 is stopped with
+# SIGSTOP for freeze_ms at that point of the recording.
+set -euo pipefail
+SECS=${1:?usage: alsa-pair <secs> [freeze_at_s freeze_ms]}
+FREEZE_AT=${2:-0}
+FREEZE_MS=${3:-300}
+B=$(dirname "$(realpath "$0")")/bounce-local
+command -v pw-record >/dev/null || { echo "alsa-pair: needs pw-record (PipeWire)" >&2; exit 1; }
+
+RUN=$("$B" up --clients 0 | tail -1)
+export BOUNCE_RUN=$RUN
+source "$RUN/run.env"
+EVIDENCE=$RUN/evidence/alsa-pair
+mkdir -p "$EVIDENCE"
+PIDS=()
+for n in 1 2; do
+  mkdir -p "$RUN/state/alsa-$n"
+  setsid "$BIN/bounce-client" --client-id "$("$B" client-id "$n")" --server "$SESSION" \
+    --data-dir "$RUN/state/alsa-$n" --output alsa >"$EVIDENCE/client-$n.log" 2>&1 &
+  PIDS+=($!)
+done
+trap 'kill -CONT "${PIDS[1]}" 2>/dev/null; kill "${PIDS[@]}" 2>/dev/null || true; "$B" down "$RUN" >/dev/null 2>&1 || true' EXIT
+
+"$B" wait '[.clients[] | select(.online)] | length == 2' 30 >/dev/null
+"$B" api POST /api/admin '{"UpsertZone":{"zone":1,"name":"Room"}}' >/dev/null
+for n in 1 2; do
+  "$B" api POST /api/admin '{"MoveClient":{"client":"'"$("$B" client-id "$n")"'","zone":1}}' >/dev/null
+done
+"$B" api POST /api/admin '{"SetZoneVolume":{"zone":1,"volume":40}}' >/dev/null
+"$B" api POST /api/admin '{"RouteZone":{"zone":1,"source":0}}' >/dev/null
+"$B" wait '[.clients[] | select(.reported.player | type == "object" and has("Playing"))] | length == 2' 30 >/dev/null
+
+timeout "$SECS" pw-record -P '{ stream.capture.sink=true }' --rate 48000 --channels 2 --format s16 "$EVIDENCE/rec.wav" &
+REC=$!
+if ((FREEZE_AT > 0)); then
+  sleep "$FREEZE_AT"
+  kill -STOP "${PIDS[1]}"
+  sleep "$(awk -v ms="$FREEZE_MS" 'BEGIN { print ms / 1000 }')"
+  kill -CONT "${PIDS[1]}"
+  echo "froze client 2 for $FREEZE_MS ms at $FREEZE_AT s" | tee "$EVIDENCE/freeze.txt"
+fi
+wait "$REC" || true
+"$B" api GET /api/state | jq -c '.clients[] | {id, player: .reported.player}' | tee "$EVIDENCE/players.json"
+
+# Each client's click is 5 ms of full scale times the volume. Where the two
+# overlap the mix doubles, so the offset is how long one click plays alone.
+python3 - "$EVIDENCE/rec.wav" <<'PY' | tee "$EVIDENCE/offsets.txt"
+import struct, sys, wave
+w = wave.open(sys.argv[1])
+rate, n = w.getframerate(), w.getnframes()
+raw = w.readframes(n)
+left = struct.unpack('<%dh' % (len(raw) // 2), raw)[0::2]
+click = 32767 * 40 // 100
+click_frames = rate // 200
+i = 0
+while i < n:
+    if abs(left[i]) <= click // 2:
+        i += 1
+        continue
+    first = i
+    second = next((j for j in range(first, min(n, first + click_frames))
+                   if abs(left[j]) > click * 3 // 2), None)
+    if second is None:
+        second = next((j for j in range(first + click_frames + 10, min(n, first + rate // 4))
+                       if abs(left[j]) > click // 2), None)
+    if second is None:
+        print(f"t={first / rate:7.2f}s offset=none")
+    else:
+        print(f"t={first / rate:7.2f}s offset_us={round((second - first) * 1e6 / rate)}")
+    i = first + rate // 2
+PY
+echo "evidence: $EVIDENCE"

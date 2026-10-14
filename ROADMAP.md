@@ -5,9 +5,10 @@ yet proven on real hardware.
 
 ## Playing audio on real speakers
 
-1. **Sound card output.** `--output alsa` is the default, but
-   `client/src/player.rs:226` just marks the output unavailable. The client
-   has no audio crate yet. This blocks everything else in this section.
+1. **Sound card output.** Done. `--output alsa` plays through ALSA,
+   corrects DAC drift by repeating or dropping single frames, and retries a
+   missing or busy device every 2 s. It is proven through PipeWire on a
+   laptop, not yet on a Pi, and a real unplug is only covered by a fake.
 2. **Output latency per speaker.** The server always sends
    `output_latency: Duration::ZERO` (`server/src/hub.rs:526`). No admin
    request can set it, and nothing measures it. Without it, rooms with
@@ -16,7 +17,11 @@ yet proven on real hardware.
    but has never been run against a real account. The verify harness only
    uses the test tone.
 4. **Sync measured on hardware.** Measure two Pis on Wi-Fi and tune the
-   playout delay to match.
+   playout delay to match. Through PipeWire, two ALSA clients on one card
+   started 0.7 to 6.4 ms apart and took about 3.5 s to slew together.
+   After that they stayed within 0.3 ms, including after a 300 ms stall.
+   Check whether a Pi's driver places the first chunk better, and tune
+   `client/src/player/drift.rs` if not.
 
 ## Deployment
 
@@ -99,7 +104,9 @@ an option.
     rest:
     - the transport and server discovery (`TcpStream` and `mdns-sd` in
       `client/src/transport.rs`)
-    - the audio output (WAV now, ALSA or I2S later)
+    - the audio output. The `Output` and `Sink` traits in
+      `client/src/player/sink.rs` are the seam: WAV and ALSA implement
+      them, and I2S would too.
     - the client ID and state storage (`/etc/machine-id` and `--data-dir`
       in `client/src/config.rs`, or the MAC address and NVS)
     - system metrics (`/proc`, `/sys` and `vcgencmd` in
@@ -120,9 +127,8 @@ an option.
 
 ## Suggested order
 
-- **24** before 1, so that the ALSA output goes in the Linux shell.
 - **25** before 5–7, since it decides which platforms those cover.
-- **1–4** turn it into a working speaker system.
+- **2–4** turn it into a working speaker system.
 - **5–7** make it installable on Pis.
 - **9** is what you'd use day to day.
 - **11–15** make problems visible once speakers are mounted on walls.

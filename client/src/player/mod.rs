@@ -1,6 +1,7 @@
 //! The audio thread: hold chunks until their deadline, then write them to
 //! the output.
 
+mod drift;
 #[cfg(test)]
 pub(crate) mod fake;
 mod sink;
@@ -20,8 +21,9 @@ use bounce_common::time::SinceBoot;
 use bounce_common::zone::Volume;
 
 use crate::clock::{self, SharedOffset};
+use drift::{Correction, DeviceClock};
 
-pub use sink::{Clock, Frames, OpenError, Output, Sink, SinkError};
+pub use sink::{Clock, Frames, OpenError, Output, Sink, SinkError, WRITE_AHEAD};
 pub use wav::{WavOutput, WavStream};
 
 pub struct PlayerHandle {
@@ -74,25 +76,80 @@ pub struct Player<O: Output> {
 
 enum State<S> {
     Idle,
-    Buffering(Track<S>),
-    Playing { track: Track<S>, cursor: SinceBoot },
-    OutputUnavailable { device: String },
+    /// Nothing heard yet. A clocked device is fed silence meanwhile, and
+    /// `cursor` is where that silence ends; `None` before the first step.
+    Buffering {
+        track: Track<S>,
+        cursor: Option<SinceBoot>,
+    },
+    /// `cursor` is content time: the local instant the next chunk frame is
+    /// heard. Correction frames never move it. `refilling` after the device
+    /// ran dry: that underrun is counted, so the silence up to the next
+    /// chunk is not.
+    Playing {
+        track: Track<S>,
+        cursor: SinceBoot,
+        refilling: bool,
+    },
+    /// Remembers what was asked for, so the player retries the open without
+    /// the server asking again. `retry_at` is set by the first step.
+    OutputUnavailable {
+        device: String,
+        wanted: Wanted,
+        retry_at: Option<SinceBoot>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct Wanted {
+    stream: StreamId,
+    format: AudioFormat,
 }
 
 struct Track<S> {
-    stream: StreamId,
-    format: AudioFormat,
+    wanted: Wanted,
     sink: S,
+    drift: DeviceClock,
 }
 
-/// No resampling: the WAV sink is paced by the deadlines and loopback has no
-/// clock drift, so drift correction waits for a real DAC.
+/// How far ahead of the listener the scheduler writes, by the sink's kind
+/// of clock. One walk serves every sink; only this row differs.
+struct Lead {
+    /// Write while the next frame would be heard at most this far ahead.
+    fill_to: Duration,
+    /// With no chunk due, write silence only once the device would run dry
+    /// within this, since a chunk may still arrive in time.
+    pad_within: Duration,
+    /// How far the cursor may fall behind `now` before the lost time is
+    /// skipped in silence. A clocked device reports that as an underrun.
+    max_behind: Option<Duration>,
+}
+
+impl Lead {
+    const WRITTEN: Self = Self {
+        fill_to: Duration::ZERO,
+        pad_within: Duration::ZERO,
+        max_behind: Some(MAX_BEHIND),
+    };
+    const DEVICE: Self = Self {
+        fill_to: WRITE_AHEAD,
+        pad_within: Duration::from_millis(15),
+        max_behind: None,
+    };
+}
+
+struct Walked {
+    heard: bool,
+    wake: SinceBoot,
+}
+
 const TOLERANCE: Duration = Duration::from_millis(1);
 const PERIOD: Duration = Duration::from_millis(10);
 /// WAV writes on a busy ext4 disk were measured blocking 26 to 180 ms.
 const MAX_BEHIND: Duration = Duration::from_millis(500);
 const NO_CLOCK_POLL: Duration = Duration::from_millis(10);
 const MAX_BUFFERED: usize = 1_000;
+const OPEN_RETRY: Duration = Duration::from_secs(2);
 
 impl PlayerHandle {
     /// # Panics
@@ -188,7 +245,7 @@ impl<O: Output> Player<O> {
     fn apply(&mut self, input: PlayerInput) {
         match input {
             PlayerInput::Chunk(chunk) => {
-                if self.state.stream() != Some(chunk.stream) {
+                if self.state.track().map(|t| t.wanted.stream) != Some(chunk.stream) {
                     return;
                 }
                 if self.buffer.len() == MAX_BUFFERED {
@@ -198,38 +255,69 @@ impl<O: Output> Player<O> {
                 self.buffer.push_back(chunk);
             }
             PlayerInput::Start { stream, format } => {
-                if self.state.stream() == Some(stream) {
+                if self.state.wanted().map(|w| w.stream) == Some(stream) {
                     return;
                 }
                 self.buffer.clear();
-                let state = match self.output.open(&self.settings.device, stream, format) {
-                    Ok(sink) => State::Buffering(Track {
-                        stream,
-                        format,
-                        sink,
-                    }),
-                    Err(OpenError(error)) => {
-                        tracing::error!(device = self.settings.device, %error, "cannot open the output");
-                        self.unavailable()
-                    }
-                };
-                self.enter(state);
+                self.open(Wanted { stream, format });
             }
             PlayerInput::Stop => {
                 self.buffer.clear();
                 self.enter(State::Idle);
             }
-            PlayerInput::Configure(settings) => self.settings = settings,
+            PlayerInput::Configure(settings) => {
+                let moved = settings.device != self.settings.device;
+                self.settings = settings;
+                if let Some(wanted) = self.state.wanted().filter(|_| moved) {
+                    self.open(wanted);
+                }
+            }
         }
+    }
+
+    /// Keeps the buffer, so a device switch resumes on the next chunk.
+    fn open(&mut self, wanted: Wanted) {
+        let before = self.state.reported();
+        // The old sink goes first: one sound card opened twice is busy.
+        drop(std::mem::replace(&mut self.state, State::Idle));
+        self.state = match self.track(wanted) {
+            Ok(track) => State::Buffering {
+                track,
+                cursor: None,
+            },
+            Err(OpenError(error)) => {
+                tracing::error!(device = self.settings.device, %error, "cannot open the output");
+                self.unavailable(wanted, None)
+            }
+        };
+        self.announce(before);
+    }
+
+    fn track(&self, wanted: Wanted) -> Result<Track<O::Sink>, OpenError> {
+        let sink = self
+            .output
+            .open(&self.settings.device, wanted.stream, wanted.format)?;
+        Ok(Track {
+            wanted,
+            sink,
+            drift: DeviceClock::new(wanted.format.sample_rate),
+        })
     }
 
     fn step(&mut self, now: SinceBoot) -> Option<SinceBoot> {
         let before = self.state.reported();
         let state = std::mem::replace(&mut self.state, State::Idle);
         let (state, wake) = match state {
-            State::Buffering(track) => self.buffering(track, now),
-            State::Playing { track, cursor } => self.playing(track, cursor, now),
-            other => (other, None),
+            State::Idle => (State::Idle, None),
+            State::Buffering { track, cursor } => self.buffering(track, cursor, now),
+            State::Playing {
+                track,
+                cursor,
+                refilling,
+            } => self.playing(track, cursor, refilling, now),
+            State::OutputUnavailable {
+                wanted, retry_at, ..
+            } => self.retry(wanted, retry_at, now),
         };
         self.state = state;
         self.announce(before);
@@ -238,24 +326,86 @@ impl<O: Output> Player<O> {
         wake
     }
 
-    fn buffering(
+    fn retry(
         &mut self,
-        track: Track<O::Sink>,
+        wanted: Wanted,
+        retry_at: Option<SinceBoot>,
         now: SinceBoot,
     ) -> (State<O::Sink>, Option<SinceBoot>) {
+        let retry_at = retry_at.unwrap_or(after(now, OPEN_RETRY));
+        if retry_at > now {
+            return (self.unavailable(wanted, Some(retry_at)), Some(retry_at));
+        }
+        match self.track(wanted) {
+            Ok(track) => {
+                tracing::info!(device = self.settings.device, "the output is back");
+                self.buffering(track, None, now)
+            }
+            Err(OpenError(error)) => {
+                tracing::debug!(device = self.settings.device, %error, "still cannot open the output");
+                let retry_at = after(now, OPEN_RETRY);
+                (self.unavailable(wanted, Some(retry_at)), Some(retry_at))
+            }
+        }
+    }
+
+    fn buffering(
+        &mut self,
+        mut track: Track<O::Sink>,
+        cursor: Option<SinceBoot>,
+        now: SinceBoot,
+    ) -> (State<O::Sink>, Option<SinceBoot>) {
+        let clock = match track.sink.clock(now) {
+            Ok(clock) => clock,
+            Err(error) => return self.failed(track, error, now, false),
+        };
+        let mut cursor = match (cursor, clock) {
+            (Some(cursor), _) => cursor,
+            (None, Clock::Device { queued }) => after(now, queued),
+            (None, Clock::Written) => match self.first_deadline(now) {
+                Ok(deadline) => deadline,
+                Err(wake) => {
+                    let state = State::Buffering {
+                        track,
+                        cursor: None,
+                    };
+                    return (state, wake);
+                }
+            },
+        };
+        match self.walk(&mut track, &mut cursor, clock, now, true) {
+            Ok(Walked { heard: true, wake }) => {
+                let state = State::Playing {
+                    track,
+                    cursor,
+                    refilling: false,
+                };
+                (state, Some(wake))
+            }
+            Ok(Walked { heard: false, wake }) => {
+                let cursor = Some(cursor);
+                (State::Buffering { track, cursor }, Some(wake))
+            }
+            Err(error) => self.failed(track, error, now, false),
+        }
+    }
+
+    /// For a sink without a clock: the first chunk's deadline once it is
+    /// due, or when to look again.
+    fn first_deadline(&mut self, now: SinceBoot) -> Result<SinceBoot, Option<SinceBoot>> {
         loop {
             let Some(chunk) = self.buffer.front() else {
-                return (State::Buffering(track), None);
+                return Err(None);
             };
             let Some(deadline) = self.deadline(chunk) else {
-                return (State::Buffering(track), Some(after(now, NO_CLOCK_POLL)));
+                return Err(Some(after(now, NO_CLOCK_POLL)));
             };
             if after(deadline, TOLERANCE) < now {
                 self.drop_late();
             } else if deadline > now {
-                return (State::Buffering(track), Some(deadline));
+                return Err(Some(deadline));
             } else {
-                return self.playing(track, deadline, now);
+                return Ok(deadline);
             }
         }
     }
@@ -264,59 +414,193 @@ impl<O: Output> Player<O> {
         &mut self,
         mut track: Track<O::Sink>,
         mut cursor: SinceBoot,
+        refilling: bool,
         now: SinceBoot,
     ) -> (State<O::Sink>, Option<SinceBoot>) {
-        match self.write_due(&mut track, &mut cursor, now) {
-            Ok(()) => (State::Playing { track, cursor }, Some(cursor)),
-            Err(SinkError::Lost(error)) => {
-                tracing::error!(device = self.settings.device, %error, "output lost");
-                (self.unavailable(), None)
+        let walked = track
+            .sink
+            .clock(now)
+            .and_then(|clock| self.walk(&mut track, &mut cursor, clock, now, refilling));
+        match walked {
+            Ok(Walked { heard, wake }) => {
+                let refilling = refilling && !heard;
+                let state = State::Playing {
+                    track,
+                    cursor,
+                    refilling,
+                };
+                (state, Some(wake))
+            }
+            Err(error) => self.failed(track, error, now, true),
+        }
+    }
+
+    /// An underrun leaves the device empty, so the next step starts it again
+    /// from `now`.
+    fn failed(
+        &mut self,
+        mut track: Track<O::Sink>,
+        error: SinkError,
+        now: SinceBoot,
+        playing: bool,
+    ) -> (State<O::Sink>, Option<SinceBoot>) {
+        match error {
+            SinkError::Underrun => {
+                track.drift = DeviceClock::new(track.wanted.format.sample_rate);
+                let state = if playing {
+                    self.counters.underruns.fetch_add(1, Ordering::Relaxed);
+                    State::Playing {
+                        track,
+                        cursor: now,
+                        refilling: true,
+                    }
+                } else {
+                    State::Buffering {
+                        track,
+                        cursor: None,
+                    }
+                };
+                (state, Some(now))
+            }
+            SinkError::Lost(error) => {
+                tracing::error!(device = self.settings.device, %error, "lost the output");
+                let retry_at = after(now, OPEN_RETRY);
+                (
+                    self.unavailable(track.wanted, Some(retry_at)),
+                    Some(retry_at),
+                )
             }
         }
     }
 
-    fn write_due(
+    /// The one scheduling walk for every sink. `priming` until a chunk is
+    /// heard: silence keeps the device fed up to the lead and is not an
+    /// underrun.
+    fn walk(
         &mut self,
         track: &mut Track<O::Sink>,
         cursor: &mut SinceBoot,
+        clock: Clock,
         now: SinceBoot,
-    ) -> Result<(), SinkError> {
-        let rate = track.format.sample_rate;
-        let channels = u64::from(track.format.channels);
-        let gain = self.gain();
-        if now > after(*cursor, MAX_BEHIND) {
-            let frames = frames_in(now.0.saturating_sub(cursor.0), rate);
-            track.sink.write(Frames::Silence { frames })?;
-            self.counters.underruns.fetch_add(1, Ordering::Relaxed);
-            *cursor = now;
+        priming: bool,
+    ) -> Result<Walked, SinkError> {
+        let rate = track.wanted.format.sample_rate;
+        let (lead, horizon) = match clock {
+            Clock::Written => (Lead::WRITTEN, now),
+            Clock::Device { queued } => {
+                let queued = Self::correct(track, cursor, now, queued, priming)?;
+                (Lead::DEVICE, SinceBoot(cursor.0.saturating_sub(queued)))
+            }
+        };
+        if let Some(max_behind) = lead.max_behind {
+            if now > after(*cursor, max_behind) {
+                let frames = frames_in(now.0.saturating_sub(cursor.0), rate);
+                track.write(Frames::Silence { frames })?;
+                self.counters.underruns.fetch_add(1, Ordering::Relaxed);
+                *cursor = now;
+            }
         }
-        while *cursor <= now {
+        let mut heard = false;
+        let wake_at = |cursor: SinceBoot, ahead: Duration| {
+            SinceBoot(now.0 + cursor.0.saturating_sub(horizon.0).saturating_sub(ahead))
+        };
+        loop {
+            if *cursor > after(horizon, lead.fill_to) {
+                let wake = wake_at(*cursor, lead.fill_to);
+                return Ok(Walked { heard, wake });
+            }
             let deadline = self.buffer.front().and_then(|c| self.deadline(c));
             match deadline {
                 Some(d) if after(d, TOLERANCE) < *cursor => self.drop_late(),
                 Some(d) if d <= after(*cursor, TOLERANCE) => {
-                    let chunk = self.buffer.pop_front().expect("deadline came from a chunk");
-                    self.scratch.clear();
-                    let samples = chunk.data.as_chunks::<2>().0;
-                    self.scratch
-                        .extend(samples.iter().map(|&s| scale(i16::from_le_bytes(s), gain)));
-                    track.sink.write(Frames::Audio {
-                        pcm: &self.scratch,
-                        play_at: chunk.play_at,
-                        heard: after(*cursor, self.settings.latency),
-                    })?;
-                    let frames = self.scratch.len() as u64 / channels;
-                    *cursor = after(*cursor, duration_of(frames, rate));
+                    self.play_front(track, cursor, priming && !heard)?;
+                    heard = true;
                 }
                 gap => {
+                    let filling = priming && !heard;
+                    let pad_within = if filling {
+                        lead.fill_to
+                    } else {
+                        lead.pad_within
+                    };
+                    if *cursor > after(horizon, pad_within) {
+                        let wake = wake_at(*cursor, pad_within);
+                        return Ok(Walked { heard, wake });
+                    }
                     let silence = gap.map_or(PERIOD, |d| d.0.saturating_sub(cursor.0).min(PERIOD));
                     let frames = frames_in(silence, rate);
-                    track.sink.write(Frames::Silence { frames })?;
-                    self.counters.underruns.fetch_add(1, Ordering::Relaxed);
+                    track.write(Frames::Silence { frames })?;
+                    if !filling {
+                        self.counters.underruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     *cursor = after(*cursor, duration_of(frames, rate));
                 }
             }
         }
+    }
+
+    /// Feeds the device-minus-content error to the drift estimate and makes
+    /// any jump it asks for. Returns what the device holds afterwards.
+    fn correct(
+        track: &mut Track<O::Sink>,
+        cursor: &mut SinceBoot,
+        now: SinceBoot,
+        queued: Duration,
+        priming: bool,
+    ) -> Result<Duration, SinkError> {
+        let rate = track.wanted.format.sample_rate;
+        track
+            .drift
+            .observe(frames_between(*cursor, after(now, queued), rate));
+        match track.drift.correction(priming) {
+            Correction::Pad(frames) => {
+                track.write(Frames::Silence { frames })?;
+                track.drift.reset();
+                Ok(queued + duration_of(frames, rate))
+            }
+            Correction::Skip(frames) => {
+                *cursor = after(*cursor, duration_of(frames, rate));
+                track.drift.reset();
+                Ok(queued)
+            }
+            Correction::None | Correction::Stretch | Correction::Squeeze => Ok(queued),
+        }
+    }
+
+    fn play_front(
+        &mut self,
+        track: &mut Track<O::Sink>,
+        cursor: &mut SinceBoot,
+        priming: bool,
+    ) -> Result<(), SinkError> {
+        let chunk = self.buffer.pop_front().expect("the walk saw a chunk");
+        let gain = self.gain();
+        let channels = usize::from(track.wanted.format.channels);
+        self.scratch.clear();
+        let samples = chunk.data.as_chunks::<2>().0;
+        self.scratch
+            .extend(samples.iter().map(|&s| scale(i16::from_le_bytes(s), gain)));
+        let frames = self.scratch.len() / channels;
+        if let Some(last) = self.scratch.len().checked_sub(channels) {
+            match track.drift.correction(priming) {
+                Correction::Stretch => {
+                    self.scratch.extend_from_within(last..);
+                    track.drift.applied(1);
+                }
+                Correction::Squeeze => {
+                    self.scratch.truncate(last);
+                    track.drift.applied(-1);
+                }
+                Correction::None | Correction::Pad(_) | Correction::Skip(_) => {}
+            }
+        }
+        track.write(Frames::Audio {
+            pcm: &self.scratch,
+            play_at: chunk.play_at,
+            heard: after(*cursor, self.settings.latency),
+        })?;
+        let rate = track.wanted.format.sample_rate;
+        *cursor = after(*cursor, duration_of(frames as u64, rate));
         Ok(())
     }
 
@@ -342,13 +626,17 @@ impl<O: Output> Player<O> {
         let Some(track) = self.state.track() else {
             return 0;
         };
-        let frames = chunk.data.len() as u64 / (2 * u64::from(track.format.channels));
-        frames * 1_000_000 / u64::from(track.format.sample_rate)
+        let format = track.wanted.format;
+        let frames = chunk.data.len() as u64 / (2 * u64::from(format.channels));
+        frames * 1_000_000 / u64::from(format.sample_rate)
     }
 
-    fn unavailable(&self) -> State<O::Sink> {
+    fn unavailable(&mut self, wanted: Wanted, retry_at: Option<SinceBoot>) -> State<O::Sink> {
+        self.buffer.clear();
         State::OutputUnavailable {
             device: self.settings.device.clone(),
+            wanted,
+            retry_at,
         }
     }
 
@@ -366,28 +654,40 @@ impl<O: Output> Player<O> {
     }
 }
 
+impl<S: Sink> Track<S> {
+    fn write(&mut self, frames: Frames<'_>) -> Result<(), SinkError> {
+        if matches!(frames, Frames::Silence { frames: 0 }) {
+            return Ok(());
+        }
+        self.sink.write(frames)
+    }
+}
+
 impl<S> State<S> {
     fn track(&self) -> Option<&Track<S>> {
         match self {
-            Self::Buffering(track) | Self::Playing { track, .. } => Some(track),
+            Self::Buffering { track, .. } | Self::Playing { track, .. } => Some(track),
             Self::Idle | Self::OutputUnavailable { .. } => None,
         }
     }
 
-    fn stream(&self) -> Option<StreamId> {
-        self.track().map(|t| t.stream)
+    fn wanted(&self) -> Option<Wanted> {
+        match self {
+            Self::OutputUnavailable { wanted, .. } => Some(*wanted),
+            other => other.track().map(|t| t.wanted),
+        }
     }
 
     fn reported(&self) -> PlayerState {
         match self {
             Self::Idle => PlayerState::Idle,
-            Self::Buffering(track) => PlayerState::Buffering {
-                stream: track.stream,
+            Self::Buffering { track, .. } => PlayerState::Buffering {
+                stream: track.wanted.stream,
             },
             Self::Playing { track, .. } => PlayerState::Playing {
-                stream: track.stream,
+                stream: track.wanted.stream,
             },
-            Self::OutputUnavailable { device } => PlayerState::OutputUnavailable {
+            Self::OutputUnavailable { device, .. } => PlayerState::OutputUnavailable {
                 device: device.clone(),
             },
         }
@@ -408,6 +708,13 @@ fn frames_in(duration: Duration, rate: u32) -> u64 {
 
 fn duration_of(frames: u64, rate: u32) -> Duration {
     Duration::from_nanos(frames * 1_000_000_000 / u64::from(rate))
+}
+
+/// `to - from` in frames, negative when `to` is earlier.
+fn frames_between(from: SinceBoot, to: SinceBoot, rate: u32) -> i64 {
+    let nanos = i128::try_from(to.0.as_nanos()).unwrap_or(i128::MAX)
+        - i128::try_from(from.0.as_nanos()).unwrap_or(i128::MAX);
+    i64::try_from(nanos * i128::from(rate) / 1_000_000_000).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -775,5 +1082,327 @@ mod tests {
         assert_eq!(received.len(), MAX_QUEUED + 1);
         assert!(matches!(received.last(), Some(PlayerInput::Stop)));
         assert_eq!(handle.counters().dropped_chunks.load(Ordering::Relaxed), 1);
+    }
+
+    mod clocked {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use super::*;
+        use crate::player::fake::{Dac, FakeOutput, Heard};
+
+        const ARRIVAL: u64 = 10;
+        const MINUTE: u64 = 60_000;
+
+        /// Plays the server's part and the audio thread's loop: a chunk
+        /// arrives every 10 ms, `lead` ms before it is due, and the player
+        /// steps after each arrival and whenever it asked to wake.
+        struct DacRig {
+            player: Player<FakeOutput>,
+            dac: Rc<RefCell<Dac>>,
+            changes: Receiver<PlayerState>,
+            lead: u64,
+            now: SinceBoot,
+            wake: Option<SinceBoot>,
+            sent: u64,
+        }
+
+        fn dac_rig(dac: Dac, lead: u64) -> DacRig {
+            let dac = dac.shared();
+            let clock = SharedOffset::default();
+            clock.set(Some(ClockOffset(0)));
+            let (changes_tx, changes) = mpsc::channel();
+            let mut player = Player::new(
+                clock,
+                FakeOutput(Rc::clone(&dac)),
+                Arc::default(),
+                changes_tx,
+            );
+            player.apply(PlayerInput::Configure(on("dac")));
+            player.apply(PlayerInput::Start {
+                stream: STREAM,
+                format: FORMAT,
+            });
+            let mut rig = DacRig {
+                player,
+                dac,
+                changes,
+                lead,
+                now: ms(0),
+                wake: None,
+                sent: 0,
+            };
+            rig.step_at(ms(0));
+            rig
+        }
+
+        fn on(device: &str) -> OutputSettings {
+            OutputSettings {
+                device: device.into(),
+                ..settings(100, false)
+            }
+        }
+
+        fn sample(seq: u64) -> i16 {
+            i16::try_from(seq % 30_000).unwrap() + 1
+        }
+
+        impl DacRig {
+            fn run_until(&mut self, until: u64) {
+                let mut repeats = 0;
+                loop {
+                    let arrival = ms(self.sent * ARRIVAL);
+                    let next = self.wake.map_or(arrival, |w| w.min(arrival)).max(self.now);
+                    if next > ms(until) {
+                        return;
+                    }
+                    repeats = if next == self.now { repeats + 1 } else { 0 };
+                    assert!(repeats < 10, "the player keeps waking at {next:?}");
+                    self.step_at(next);
+                }
+            }
+
+            /// The audio thread is descheduled until `at`; chunks wait in
+            /// the channel meanwhile.
+            fn stall_until(&mut self, at: u64) {
+                self.step_at(ms(at));
+            }
+
+            fn step_at(&mut self, now: SinceBoot) {
+                self.now = now;
+                while ms(self.sent * ARRIVAL) <= now {
+                    let play_at = self.sent * ARRIVAL + self.lead;
+                    self.player
+                        .apply(chunk(self.sent, play_at, sample(self.sent)));
+                    self.sent += 1;
+                }
+                self.wake = self.player.step(now);
+            }
+
+            fn heard(&self) -> Vec<Heard> {
+                self.dac.borrow().heard.clone()
+            }
+
+            fn states(&self) -> Vec<PlayerState> {
+                self.changes.try_iter().collect()
+            }
+
+            fn counter(&self, pick: fn(&PlaybackCounters) -> &AtomicU64) -> u64 {
+                pick(&self.player.counters).load(Ordering::Relaxed)
+            }
+        }
+
+        /// How late each chunk was heard against its deadline, in µs.
+        fn lateness(heard: &Heard) -> i64 {
+            let at = i64::try_from(heard.at.0.as_micros()).unwrap();
+            at - i64::try_from(heard.play_at.0).unwrap()
+        }
+
+        fn worst(heard: &[Heard]) -> i64 {
+            heard.iter().map(|h| lateness(h).abs()).max().unwrap()
+        }
+
+        fn playing() -> PlayerState {
+            PlayerState::Playing { stream: STREAM }
+        }
+
+        fn buffering() -> PlayerState {
+            PlayerState::Buffering { stream: STREAM }
+        }
+
+        #[test]
+        fn a_drifting_dac_stays_within_a_millisecond_of_content_for_ten_minutes() {
+            for ppm in [-200.0, 0.0, 33.0, 200.0] {
+                let mut rig = dac_rig(
+                    Dac {
+                        ppm,
+                        ..Dac::default()
+                    },
+                    1_000,
+                );
+                rig.run_until(10 * MINUTE);
+
+                let heard = rig.heard();
+                assert!(heard.len() > 59_800, "{ppm} ppm: heard {}", heard.len());
+                assert!(
+                    worst(&heard) < 1_000,
+                    "{ppm} ppm: off by {} µs",
+                    worst(&heard)
+                );
+                assert_eq!(rig.counter(|c| &c.underruns), 0, "{ppm} ppm: underruns");
+                assert_eq!(rig.counter(|c| &c.late_chunks), 0, "{ppm} ppm: late chunks");
+                let max_queued = rig.dac.borrow().max_queued;
+                assert!(
+                    max_queued < 2 * WRITE_AHEAD,
+                    "{ppm} ppm: the device held {max_queued:?}, so a real write would block"
+                );
+            }
+        }
+
+        #[test]
+        fn period_quantized_delay_readings_hold_within_a_millisecond() {
+            let dac = Dac {
+                ppm: 33.0,
+                quantum: 1_024,
+                ..Dac::default()
+            };
+            let mut rig = dac_rig(dac, 1_000);
+            rig.run_until(3 * MINUTE);
+
+            let heard = rig.heard();
+            assert!(heard.len() > 17_800, "heard {}", heard.len());
+            assert!(worst(&heard) < 1_000, "off by {} µs", worst(&heard));
+            assert_eq!(rig.counter(|c| &c.underruns), 0);
+            assert_eq!(rig.counter(|c| &c.late_chunks), 0);
+        }
+
+        #[test]
+        fn the_start_transient_lands_the_first_chunk_on_its_deadline() {
+            let dac = Dac {
+                start_delay: Duration::from_millis(60),
+                ..Dac::default()
+            };
+            let mut rig = dac_rig(dac, 300);
+            rig.run_until(2_000);
+
+            let heard = rig.heard();
+            assert_eq!(heard[0].first_sample, sample(0), "the first chunk is heard");
+            assert!(
+                lateness(&heard[0]).abs() < 100,
+                "first chunk off by {} µs",
+                lateness(&heard[0])
+            );
+            assert!(worst(&heard) < 1_000, "off by {} µs", worst(&heard));
+            assert_eq!(rig.counter(|c| &c.underruns), 0);
+            assert_eq!(rig.counter(|c| &c.late_chunks), 0);
+            assert_eq!(rig.states(), [buffering(), playing()]);
+        }
+
+        #[test]
+        fn a_stalled_thread_counts_one_underrun_and_resumes_on_the_deadlines() {
+            let mut rig = dac_rig(Dac::default(), 1_000);
+            rig.run_until(3_000);
+            let before = rig.heard().len();
+            rig.stall_until(3_305);
+            rig.run_until(5_000);
+
+            assert_eq!(rig.counter(|c| &c.underruns), 1);
+            let resumed = &rig.heard()[before..];
+            assert_eq!(
+                resumed[0].play_at,
+                ServerInstant(3_310_000),
+                "playback resumes on the first chunk still in the future"
+            );
+            assert!(worst(resumed) < 1_000, "off by {} µs", worst(resumed));
+            assert!(
+                rig.counter(|c| &c.late_chunks) > 0,
+                "chunks due in the stall are dropped"
+            );
+            assert_eq!(rig.states(), [buffering(), playing()], "stays Playing");
+        }
+
+        #[test]
+        fn an_unplugged_device_is_retried_until_it_plays_again() {
+            let mut rig = dac_rig(Dac::default(), 1_000);
+            rig.run_until(2_000);
+            rig.dac.borrow_mut().unplugged = true;
+            rig.run_until(2_100);
+            let unavailable = PlayerState::OutputUnavailable {
+                device: "dac".into(),
+            };
+            assert_eq!(rig.states(), [buffering(), playing(), unavailable]);
+
+            rig.dac.borrow_mut().unplugged = false;
+            let before = rig.heard().len();
+            rig.run_until(7_000);
+            assert_eq!(
+                rig.states(),
+                [buffering(), playing()],
+                "back without a new Start"
+            );
+            let resumed = &rig.heard()[before..];
+            assert!(
+                resumed.len() > 100,
+                "heard {} after the replug",
+                resumed.len()
+            );
+            assert!(worst(resumed) < 1_000, "off by {} µs", worst(resumed));
+            assert_eq!(rig.counter(|c| &c.underruns), 0);
+        }
+
+        #[test]
+        fn a_busy_device_is_retried_until_it_opens() {
+            let mut rig = dac_rig(
+                Dac {
+                    busy: true,
+                    ..Dac::default()
+                },
+                1_000,
+            );
+            rig.run_until(500);
+            let unavailable = PlayerState::OutputUnavailable {
+                device: "dac".into(),
+            };
+            assert_eq!(rig.states(), [unavailable]);
+
+            rig.dac.borrow_mut().busy = false;
+            rig.run_until(5_000);
+            assert_eq!(rig.states(), [buffering(), playing()]);
+            let heard = rig.heard();
+            assert!(heard.len() > 100, "heard {}", heard.len());
+            assert!(worst(&heard) < 1_000, "off by {} µs", worst(&heard));
+        }
+
+        #[test]
+        fn configure_moves_playback_to_another_device_on_the_deadlines() {
+            let mut rig = dac_rig(Dac::default(), 1_000);
+            rig.run_until(2_000);
+            rig.player.apply(PlayerInput::Configure(on("other")));
+            rig.run_until(4_000);
+
+            let heard = rig.heard();
+            let first_moved = heard.iter().position(|h| h.device == "other").unwrap();
+            assert!(
+                heard[first_moved..].iter().all(|h| h.device == "other"),
+                "nothing more is heard on the old device"
+            );
+            assert!(
+                heard[first_moved].play_at <= ServerInstant(2_070_000),
+                "the new device resumes with the first chunk the old one was not given, \
+                 at {:?}",
+                heard[first_moved].play_at
+            );
+            assert!(worst(&heard) < 1_000, "off by {} µs", worst(&heard));
+            assert_eq!(rig.dac.borrow().opens, ["dac", "other"]);
+            assert_eq!(
+                rig.states(),
+                [buffering(), playing(), buffering(), playing()]
+            );
+        }
+
+        #[test]
+        fn a_resent_start_or_configure_changes_nothing() {
+            let mut rig = dac_rig(Dac::default(), 1_000);
+            rig.run_until(2_000);
+            for at in (2_000..3_000).step_by(100) {
+                rig.player.apply(PlayerInput::Configure(on("dac")));
+                rig.player.apply(PlayerInput::Start {
+                    stream: STREAM,
+                    format: FORMAT,
+                });
+                rig.run_until(at + 100);
+            }
+
+            assert_eq!(rig.dac.borrow().opens, ["dac"]);
+            assert_eq!(rig.states(), [buffering(), playing()]);
+            let heard = rig.heard();
+            assert_eq!(
+                heard.iter().map(|h| h.first_sample).collect::<Vec<_>>(),
+                (0..heard.len() as u64).map(sample).collect::<Vec<_>>(),
+                "every chunk is heard once, in order"
+            );
+            assert!(worst(&heard) < 1_000, "off by {} µs", worst(&heard));
+            assert_eq!(rig.counter(|c| &c.underruns), 0);
+        }
     }
 }

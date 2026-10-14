@@ -1,9 +1,7 @@
-//! Sound card output through ALSA, for Linux speakers.
-
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use alsa::device_name::HintIter;
+use alsa::device_name::{Hint, HintIter};
 use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
 use bounce_common::audio::AudioFormat;
@@ -32,10 +30,7 @@ impl Output for AlsaOutput {
 
     fn devices(&self) -> Vec<OutputDevice> {
         match HintIter::new_str(None, "pcm") {
-            Ok(hints) => advertised(hints.filter_map(|hint| {
-                let playback = hint.direction != Some(Direction::Capture);
-                Some((hint.name?, hint.desc, playback))
-            })),
+            Ok(hints) => advertised(hints),
             Err(error) => {
                 tracing::warn!(%error, "cannot list ALSA devices");
                 advertised(std::iter::empty())
@@ -65,8 +60,6 @@ fn open(device: &str, format: AudioFormat) -> Result<AlsaSink, String> {
     })
 }
 
-/// Blocking writes of interleaved native-endian i16, about 10 ms periods in
-/// a buffer twice the scheduler's lead, started by the first frame.
 fn configure(pcm: &PCM, format: AudioFormat) -> alsa::Result<()> {
     let hw = HwParams::any(pcm)?;
     hw.set_access(Access::RWInterleaved)?;
@@ -88,13 +81,11 @@ fn configure(pcm: &PCM, format: AudioFormat) -> alsa::Result<()> {
 impl Sink for AlsaSink {
     fn clock(&mut self, now: SinceBoot) -> Result<Clock, SinkError> {
         let delay = self.pcm.delay().map_err(|e| self.fail(e))?;
-        // The step's `now` was read before this call; the thread may have
-        // been preempted since.
-        let read_at = clock::now();
+        let since_step = clock::now().0.saturating_sub(now.0);
         let frames = u64::try_from(delay).unwrap_or(0);
         let delay = Duration::from_nanos(frames * 1_000_000_000 / u64::from(self.rate));
         Ok(Clock::Device {
-            queued: delay + read_at.0.saturating_sub(now.0),
+            queued: delay + since_step,
         })
     }
 
@@ -115,8 +106,6 @@ impl Sink for AlsaSink {
 }
 
 impl AlsaSink {
-    /// Blocks only while the device holds more than the scheduler's lead,
-    /// which the buffer of twice that never reaches.
     fn write_all(&self, mut samples: &[i16]) -> Result<(), SinkError> {
         let io = self.pcm.io_i16().map_err(|e| self.fail(e))?;
         while !samples.is_empty() {
@@ -150,22 +139,23 @@ fn interrupted(error: alsa::Error) -> bool {
     std::io::Error::from_raw_os_error(error.errno()).kind() == ErrorKind::Interrupted
 }
 
-/// The devices worth offering the server, from ALSA's name hints as
-/// `(name, description, can play)`. `default` comes first, so the server's
-/// natural pick follows the system's own choice.
-fn advertised(hints: impl Iterator<Item = (String, Option<String>, bool)>) -> Vec<OutputDevice> {
+/// `default` comes first because the server plays the first device a client
+/// advertises.
+fn advertised(hints: impl Iterator<Item = Hint>) -> Vec<OutputDevice> {
     const PLUMBING: [&str; 5] = ["surround", "dmix", "dsnoop", "iec958", "usbstream"];
     let mut devices = vec![OutputDevice {
         id: "default".into(),
         description: "Default ALSA output".into(),
     }];
-    for (id, description, playback) in hints {
+    for hint in hints {
+        let Some(id) = hint.name else { continue };
         let plumbing = PLUMBING.iter().any(|prefix| id.starts_with(prefix));
-        if !playback || plumbing || id == "null" {
+        if hint.direction == Some(Direction::Capture) || plumbing || id == "null" {
             continue;
         }
-        let description =
-            description.map_or_else(String::new, |d| d.lines().collect::<Vec<_>>().join(" "));
+        let description = hint
+            .desc
+            .map_or_else(String::new, |d| d.lines().collect::<Vec<_>>().join(" "));
         match devices.iter_mut().find(|d| d.id == id) {
             Some(known) if id == "default" => known.description = description,
             Some(_) => {}
@@ -179,8 +169,6 @@ fn advertised(hints: impl Iterator<Item = (String, Option<String>, bool)>) -> Ve
 mod tests {
     use super::*;
 
-    /// ALSA's pcm hints on the development machine, which match `aplay -L`.
-    /// None is capture-only there.
     const HINTS: &[(&str, &str, bool)] = &[
         ("null", "Discard all samples (playback) or generate zero samples (capture)", true),
         ("pipewire", "PipeWire Sound Server", true),
@@ -200,8 +188,10 @@ mod tests {
     ];
 
     fn from(hints: &[(&str, &str, bool)]) -> Vec<OutputDevice> {
-        advertised(hints.iter().map(|&(id, description, playback)| {
-            (id.to_owned(), Some(description.to_owned()), playback)
+        advertised(hints.iter().map(|&(id, description, playback)| Hint {
+            name: Some(id.to_owned()),
+            desc: Some(description.to_owned()),
+            direction: (!playback).then_some(Direction::Capture),
         }))
     }
 

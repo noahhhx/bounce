@@ -1,50 +1,33 @@
-//! How far a sound card's clock has walked from the content cursor, and the
-//! correction that brings it back.
-
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// Tracks the error `device position - content cursor` in frames.
-/// Positive: the device will play the next content frame late.
-///
 /// Readings are noisy upward: a driver that moves its hardware pointer once
 /// per period reports a stale, larger delay until the next interrupt. So the
-/// estimate is the minimum over a window, as `ClockSync` does with round
-/// trips. Corrections are subtracted from the readings taken before them, so
-/// none is counted twice.
+/// estimate is the minimum over a window.
 pub struct DeviceClock {
     rate: u32,
-    /// Each raw reading minus `applied` at the time it was taken.
     readings: VecDeque<i64>,
-    /// Net frames inserted (+) or dropped (-) since the last reset.
-    applied: i64,
+    inserted: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Correction {
     None,
-    /// Repeat one frame of the next chunk: the device is ahead of content.
-    Stretch,
-    /// Drop one frame of the next chunk: the device is behind content.
-    Squeeze,
-    /// Write this many frames of silence: the device is far ahead.
-    Pad(u64),
-    /// Move the content cursor this many frames later: the device is far
-    /// behind.
-    Skip(u64),
+    RepeatFrame,
+    DropFrame,
+    PadSilence(u64),
+    SkipAhead(u64),
 }
 
-/// About half a second of steps, enough for the minimum to find a fresh
-/// reading on a driver that moves its pointer once per period.
+/// Long enough for the minimum to catch a fresh reading on a driver that
+/// moves its pointer once per period.
 const WINDOW: usize = 100;
-/// Enough readings to tell settled from still moving while priming, as
-/// after `PipeWire`'s measured 60 ms start delay.
+/// `PipeWire` was measured holding its delay still for 60 ms after a start.
 const PRIME_WINDOW: usize = 10;
-/// The window minimum still reads up to a fraction of a period high, and
-/// that adds to whatever the deadband lets through.
+/// With delay readings in 1024-frame steps the error reached 0.67 ms at this
+/// deadband and 1.15 ms at 0.5 ms.
 const DEADBAND: Duration = Duration::from_micros(250);
-/// Past this a frame per chunk would take seconds to catch up, so jump.
-const STEP: Duration = Duration::from_millis(20);
+const JUMP_PAST: Duration = Duration::from_millis(20);
 
 impl DeviceClock {
     #[must_use]
@@ -52,26 +35,21 @@ impl DeviceClock {
         Self {
             rate,
             readings: VecDeque::with_capacity(WINDOW),
-            applied: 0,
+            inserted: 0,
         }
     }
 
-    pub fn observe(&mut self, error: i64) {
+    pub fn observe(&mut self, frames_late: i64) {
         if self.readings.len() == WINDOW {
             self.readings.pop_front();
         }
-        self.readings.push_back(error - self.applied);
+        self.readings.push_back(frames_late - self.inserted);
     }
 
-    /// `priming` while nothing has been heard since the device started, so
-    /// a jump costs nothing. Then a few readings that agree within the
-    /// deadband are trusted at once, a few that still move or scatter may
-    /// only jump a large error away, and a full window jumps anything past
-    /// the deadband. Once playing, only a full window acts.
     #[must_use]
     pub fn correction(&self, priming: bool) -> Correction {
         let deadband = self.frames(DEADBAND);
-        let step = self.frames(STEP);
+        let step = self.frames(JUMP_PAST);
         let (window, jump) = match (self.readings.len(), priming) {
             (WINDOW, true) => (WINDOW, deadband),
             (WINDOW, false) => (WINDOW, step),
@@ -86,25 +64,23 @@ impl DeviceClock {
             _ => return Correction::None,
         };
         let newest = self.readings.iter().rev().take(window);
-        let error = newest.min().expect("the window holds readings") + self.applied;
+        let error = newest.min().expect("the window holds readings") + self.inserted;
         match error {
-            e if e < -jump => Correction::Pad(e.unsigned_abs()),
-            e if e > jump => Correction::Skip(e.unsigned_abs()),
-            e if e < -deadband => Correction::Stretch,
-            e if e > deadband => Correction::Squeeze,
+            e if e < -jump => Correction::PadSilence(e.unsigned_abs()),
+            e if e > jump => Correction::SkipAhead(e.unsigned_abs()),
+            e if e < -deadband => Correction::RepeatFrame,
+            e if e > deadband => Correction::DropFrame,
             _ => Correction::None,
         }
     }
 
-    /// Frames inserted (+) or dropped (-) by a stretch or squeeze.
-    pub fn applied(&mut self, frames: i64) {
-        self.applied += frames;
+    pub fn inserted(&mut self, frames: i64) {
+        self.inserted += frames;
     }
 
-    /// After a pad or skip every reading is stale.
     pub fn reset(&mut self) {
         self.readings.clear();
-        self.applied = 0;
+        self.inserted = 0;
     }
 
     fn frames(&self, duration: Duration) -> i64 {
@@ -134,7 +110,7 @@ mod tests {
         );
         assert_eq!(
             clock_after(&[-5_000; WINDOW]).correction(false),
-            Correction::Pad(5_000)
+            Correction::PadSilence(5_000)
         );
     }
 
@@ -146,7 +122,7 @@ mod tests {
         readings[40] = 100;
         assert_eq!(
             clock_after(&readings).correction(false),
-            Correction::Squeeze
+            Correction::DropFrame
         );
     }
 
@@ -154,7 +130,7 @@ mod tests {
     fn applied_frames_are_not_counted_twice() {
         let mut clock = clock_after(&[-40; WINDOW]);
         for _ in 0..28 {
-            clock.applied(1);
+            clock.inserted(1);
         }
         assert_eq!(
             clock.correction(false),
@@ -166,7 +142,7 @@ mod tests {
         }
         assert_eq!(
             clock.correction(false),
-            Correction::Stretch,
+            Correction::RepeatFrame,
             "a reading taken after the corrections already includes them"
         );
     }
@@ -177,7 +153,7 @@ mod tests {
         readings.extend([2_000; PRIME_WINDOW]);
         assert_eq!(
             clock_after(&readings).correction(true),
-            Correction::Skip(2_000),
+            Correction::SkipAhead(2_000),
             "a start-up error is jumped once a few readings agree"
         );
         assert_eq!(
@@ -187,7 +163,7 @@ mod tests {
         );
         assert_eq!(
             clock_after(&[30; PRIME_WINDOW]).correction(true),
-            Correction::Skip(30),
+            Correction::SkipAhead(30),
             "a few readings that agree place the first chunk exactly"
         );
         let scattered: Vec<i64> = (0..PRIME_WINDOW)
@@ -195,17 +171,17 @@ mod tests {
             .collect();
         assert_eq!(
             clock_after(&scattered).correction(true),
-            Correction::Squeeze,
+            Correction::DropFrame,
             "a few scattered readings may be stale, so only a slew"
         );
         assert_eq!(
             clock_after(&[30; WINDOW]).correction(true),
-            Correction::Skip(30),
+            Correction::SkipAhead(30),
             "a full window places the first chunk exactly"
         );
         assert_eq!(
             clock_after(&[30; WINDOW]).correction(false),
-            Correction::Squeeze,
+            Correction::DropFrame,
             "while playing the same error is slewed"
         );
     }

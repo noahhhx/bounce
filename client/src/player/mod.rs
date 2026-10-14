@@ -1,7 +1,5 @@
-//! The audio thread: hold chunks until their deadline and hand them to the
-//! output so each is heard on time. A WAV file is written at the deadline.
-//! A sound card is kept [`WRITE_AHEAD`] ahead, and its crystal's drift
-//! from the local clock is corrected one frame at a time.
+//! The audio thread: hold chunks until their deadline, then write them to
+//! the output.
 
 #[cfg(target_os = "linux")]
 mod alsa_output;
@@ -76,29 +74,20 @@ pub struct Player<O: Output> {
     clock: SharedOffset,
     counters: Arc<PlaybackCounters>,
     changes: Sender<PlayerState>,
-    /// Reused for gain, so steady playback does not allocate.
-    scratch: Vec<i16>,
+    gained: Vec<i16>,
 }
 
 enum State<S> {
     Idle,
-    /// Nothing heard yet. A clocked device is fed silence meanwhile, and
-    /// `cursor` is where that silence ends; `None` before the first step.
     Buffering {
         track: Track<S>,
         cursor: Option<SinceBoot>,
     },
-    /// `cursor` is content time: the local instant the next chunk frame is
-    /// heard. Correction frames never move it. `refilling` after the device
-    /// ran dry: that underrun is counted, so the silence up to the next
-    /// chunk is not.
     Playing {
         track: Track<S>,
         cursor: SinceBoot,
-        refilling: bool,
+        underrun_counted: bool,
     },
-    /// Remembers what was asked for, so the player retries the open without
-    /// the server asking again. `retry_at` is set by the first step.
     OutputUnavailable {
         device: String,
         wanted: Wanted,
@@ -118,34 +107,26 @@ struct Track<S> {
     drift: DeviceClock,
 }
 
-/// How far ahead of the listener the scheduler writes, by the sink's kind
-/// of clock. One walk serves every sink; only this row differs.
 struct Lead {
-    /// Write while the next frame would be heard at most this far ahead.
     fill_to: Duration,
-    /// With no chunk due, write silence only once the device would run dry
-    /// within this, since a chunk may still arrive in time.
-    pad_within: Duration,
-    /// How far the cursor may fall behind `now` before the time is lost,
-    /// and counted as an underrun.
+    pad_when_dry_within: Duration,
     max_behind: Duration,
-    /// The soonest the walk asks to run again.
     min_wake: Duration,
 }
 
 impl Lead {
     const WRITTEN: Self = Self {
         fill_to: Duration::ZERO,
-        pad_within: Duration::ZERO,
+        pad_when_dry_within: Duration::ZERO,
         max_behind: MAX_BEHIND,
         min_wake: Duration::ZERO,
     };
     /// `PipeWire` was measured running dry without an error, so content that
-    /// should already be playing means the device starved. A device that
-    /// is not draining would otherwise wake the walk continuously.
+    /// should already be playing means the device starved. While `PipeWire`
+    /// holds back its first 60 ms, the walk would otherwise wake every 0.3 ms.
     const DEVICE: Self = Self {
         fill_to: WRITE_AHEAD,
-        pad_within: Duration::from_millis(15),
+        pad_when_dry_within: Duration::from_millis(15),
         max_behind: Duration::ZERO,
         min_wake: Duration::from_millis(5),
     };
@@ -232,7 +213,7 @@ impl<O: Output> Player<O> {
             clock,
             counters,
             changes,
-            scratch: Vec::new(),
+            gained: Vec::new(),
         }
     }
 
@@ -288,7 +269,6 @@ impl<O: Output> Player<O> {
         }
     }
 
-    /// Keeps the buffer, so a device switch resumes on the next chunk.
     fn open(&mut self, wanted: Wanted) {
         let before = self.state.reported();
         // The old sink goes first: one sound card opened twice is busy.
@@ -326,8 +306,8 @@ impl<O: Output> Player<O> {
             State::Playing {
                 track,
                 cursor,
-                refilling,
-            } => self.playing(track, cursor, refilling, now),
+                underrun_counted,
+            } => self.playing(track, cursor, underrun_counted, now),
             State::OutputUnavailable {
                 wanted, retry_at, ..
             } => self.retry(wanted, retry_at, now),
@@ -391,7 +371,7 @@ impl<O: Output> Player<O> {
                 let state = State::Playing {
                     track,
                     cursor,
-                    refilling: false,
+                    underrun_counted: false,
                 };
                 (state, Some(wake))
             }
@@ -403,8 +383,6 @@ impl<O: Output> Player<O> {
         }
     }
 
-    /// For a sink without a clock: the first chunk's deadline once it is
-    /// due, or when to look again.
     fn first_deadline(&mut self, now: SinceBoot) -> Result<SinceBoot, Option<SinceBoot>> {
         loop {
             let Some(chunk) = self.buffer.front() else {
@@ -427,20 +405,20 @@ impl<O: Output> Player<O> {
         &mut self,
         mut track: Track<O::Sink>,
         mut cursor: SinceBoot,
-        refilling: bool,
+        underrun_counted: bool,
         now: SinceBoot,
     ) -> (State<O::Sink>, Option<SinceBoot>) {
         let walked = track
             .sink
             .clock(now)
-            .and_then(|clock| self.walk(&mut track, &mut cursor, clock, now, refilling));
+            .and_then(|clock| self.walk(&mut track, &mut cursor, clock, now, underrun_counted));
         match walked {
             Ok(Walked { heard, wake }) => {
-                let refilling = refilling && !heard;
+                let underrun_counted = underrun_counted && !heard;
                 let state = State::Playing {
                     track,
                     cursor,
-                    refilling,
+                    underrun_counted,
                 };
                 (state, Some(wake))
             }
@@ -448,7 +426,6 @@ impl<O: Output> Player<O> {
         }
     }
 
-    /// After an underrun content resumes where the device is now.
     fn failed(
         &mut self,
         mut track: Track<O::Sink>,
@@ -468,7 +445,7 @@ impl<O: Output> Player<O> {
                     State::Playing {
                         track,
                         cursor,
-                        refilling: true,
+                        underrun_counted: true,
                     }
                 } else {
                     State::Buffering {
@@ -489,9 +466,6 @@ impl<O: Output> Player<O> {
         }
     }
 
-    /// The one scheduling walk for every sink. `priming` until a chunk is
-    /// heard: silence keeps the device fed up to the lead and is not an
-    /// underrun.
     fn walk(
         &mut self,
         track: &mut Track<O::Sink>,
@@ -536,13 +510,13 @@ impl<O: Output> Player<O> {
                 }
                 gap => {
                     let filling = priming && !heard;
-                    let pad_within = if filling {
+                    let pad_when_dry_within = if filling {
                         lead.fill_to
                     } else {
-                        lead.pad_within
+                        lead.pad_when_dry_within
                     };
-                    if *cursor > after(horizon, pad_within) {
-                        let wake = wake_at(*cursor, pad_within);
+                    if *cursor > after(horizon, pad_when_dry_within) {
+                        let wake = wake_at(*cursor, pad_when_dry_within);
                         return Ok(Walked { heard, wake });
                     }
                     let silence = gap.map_or(PERIOD, |d| d.0.saturating_sub(cursor.0).min(PERIOD));
@@ -557,8 +531,6 @@ impl<O: Output> Player<O> {
         }
     }
 
-    /// Feeds the device-minus-content error to the drift estimate and makes
-    /// any jump it asks for. Returns what the device holds afterwards.
     fn correct(
         track: &mut Track<O::Sink>,
         cursor: &mut SinceBoot,
@@ -571,17 +543,17 @@ impl<O: Output> Player<O> {
             .drift
             .observe(frames_between(*cursor, after(now, queued), rate));
         match track.drift.correction(priming) {
-            Correction::Pad(frames) => {
+            Correction::PadSilence(frames) => {
                 track.write(Frames::Silence { frames })?;
                 track.drift.reset();
                 Ok(queued + duration_of(frames, rate))
             }
-            Correction::Skip(frames) => {
+            Correction::SkipAhead(frames) => {
                 *cursor = after(*cursor, duration_of(frames, rate));
                 track.drift.reset();
                 Ok(queued)
             }
-            Correction::None | Correction::Stretch | Correction::Squeeze => Ok(queued),
+            Correction::None | Correction::RepeatFrame | Correction::DropFrame => Ok(queued),
         }
     }
 
@@ -594,26 +566,26 @@ impl<O: Output> Player<O> {
         let chunk = self.buffer.pop_front().expect("the walk saw a chunk");
         let gain = self.gain();
         let channels = usize::from(track.wanted.format.channels);
-        self.scratch.clear();
+        self.gained.clear();
         let samples = chunk.data.as_chunks::<2>().0;
-        self.scratch
+        self.gained
             .extend(samples.iter().map(|&s| scale(i16::from_le_bytes(s), gain)));
-        let frames = self.scratch.len() / channels;
-        if let Some(last) = self.scratch.len().checked_sub(channels) {
+        let frames = self.gained.len() / channels;
+        if let Some(last) = self.gained.len().checked_sub(channels) {
             match track.drift.correction(priming) {
-                Correction::Stretch => {
-                    self.scratch.extend_from_within(last..);
-                    track.drift.applied(1);
+                Correction::RepeatFrame => {
+                    self.gained.extend_from_within(last..);
+                    track.drift.inserted(1);
                 }
-                Correction::Squeeze => {
-                    self.scratch.truncate(last);
-                    track.drift.applied(-1);
+                Correction::DropFrame => {
+                    self.gained.truncate(last);
+                    track.drift.inserted(-1);
                 }
-                Correction::None | Correction::Pad(_) | Correction::Skip(_) => {}
+                Correction::None | Correction::PadSilence(_) | Correction::SkipAhead(_) => {}
             }
         }
         track.write(Frames::Audio {
-            pcm: &self.scratch,
+            pcm: &self.gained,
             play_at: chunk.play_at,
             heard: after(*cursor, self.settings.latency),
         })?;
@@ -728,7 +700,6 @@ fn duration_of(frames: u64, rate: u32) -> Duration {
     Duration::from_nanos(frames * 1_000_000_000 / u64::from(rate))
 }
 
-/// `to - from` in frames, negative when `to` is earlier.
 fn frames_between(from: SinceBoot, to: SinceBoot, rate: u32) -> i64 {
     let nanos = i128::try_from(to.0.as_nanos()).unwrap_or(i128::MAX)
         - i128::try_from(from.0.as_nanos()).unwrap_or(i128::MAX);
@@ -1112,9 +1083,6 @@ mod tests {
         const ARRIVAL: u64 = 10;
         const MINUTE: u64 = 60_000;
 
-        /// Plays the server's part and the audio thread's loop: a chunk
-        /// arrives every 10 ms, `lead` ms before it is due, and the player
-        /// steps after each arrival and whenever it asked to wake.
         struct DacRig {
             player: Player<FakeOutput>,
             dac: Rc<RefCell<Dac>>,
@@ -1180,8 +1148,6 @@ mod tests {
                 }
             }
 
-            /// The audio thread is descheduled until `at`; chunks wait in
-            /// the channel meanwhile.
             fn stall_until(&mut self, at: u64) {
                 self.step_at(ms(at));
             }
@@ -1210,14 +1176,13 @@ mod tests {
             }
         }
 
-        /// How late each chunk was heard against its deadline, in µs.
-        fn lateness(heard: &Heard) -> i64 {
+        fn lateness_us(heard: &Heard) -> i64 {
             let at = i64::try_from(heard.at.0.as_micros()).unwrap();
             at - i64::try_from(heard.play_at.0).unwrap()
         }
 
         fn worst(heard: &[Heard]) -> i64 {
-            heard.iter().map(|h| lateness(h).abs()).max().unwrap()
+            heard.iter().map(|h| lateness_us(h).abs()).max().unwrap()
         }
 
         fn playing() -> PlayerState {
@@ -1286,9 +1251,9 @@ mod tests {
             let heard = rig.heard();
             assert_eq!(heard[0].first_sample, sample(0), "the first chunk is heard");
             assert!(
-                lateness(&heard[0]).abs() < 100,
+                lateness_us(&heard[0]).abs() < 100,
                 "first chunk off by {} µs",
-                lateness(&heard[0])
+                lateness_us(&heard[0])
             );
             assert!(worst(&heard) < 1_000, "off by {} µs", worst(&heard));
             assert_eq!(rig.counter(|c| &c.underruns), 0);

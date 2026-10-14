@@ -1,7 +1,3 @@
-//! What a platform implements to make sound. The scheduler in the parent
-//! module decides what to write and when; a sink only opens, says how its
-//! clock works, and takes frames.
-
 use std::time::Duration;
 
 use bounce_common::audio::AudioFormat;
@@ -9,7 +5,6 @@ use bounce_common::ids::StreamId;
 use bounce_common::protocol::OutputDevice;
 use bounce_common::time::{ServerInstant, SinceBoot};
 
-/// A platform's way of producing sound: WAV files, ALSA, later I2S.
 pub trait Output {
     type Sink: Sink;
 
@@ -31,8 +26,7 @@ pub trait Output {
 
 /// One open stream on one device. Dropping it stops the device at once.
 pub trait Sink {
-    /// Asked once per step, before any write. `now` is the step's time,
-    /// passed so a fake device needs no clock of its own.
+    /// Asked once per step, before any write. `now` is the step's time.
     ///
     /// # Errors
     ///
@@ -85,7 +79,5 @@ pub enum SinkError {
 #[derive(Debug)]
 pub struct OpenError(pub String);
 
-/// How far ahead the scheduler keeps a clocked device. Network jitter is
-/// absorbed by the chunk buffer, so this only covers the audio thread
-/// waking late.
+/// How far ahead the scheduler keeps a clocked device.
 pub const WRITE_AHEAD: Duration = Duration::from_millis(50);

@@ -1,5 +1,3 @@
-//! Outputs for tests.
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,7 +9,6 @@ use bounce_common::time::{ServerInstant, SinceBoot};
 
 use super::sink::{Clock, Frames, OpenError, Output, Sink, SinkError};
 
-/// An output whose every open fails, like a missing sound card.
 pub struct Unavailable;
 
 pub enum NoSink {}
@@ -38,27 +35,18 @@ impl Sink for NoSink {
     }
 }
 
-/// A simulated sound card. It consumes frames at its own crystal rate from
-/// the first write, runs dry when nothing is left, and records when each
-/// chunk's first frame was heard. Time is whatever the player's step says.
 #[derive(Default)]
 pub struct Dac {
-    /// Positive: the crystal runs fast and consumes more than nominal.
     pub ppm: f64,
-    /// How long after a start the device begins to consume, as `PipeWire` was
-    /// measured doing.
+    /// As `PipeWire` was measured doing after a start.
     pub start_delay: Duration,
-    /// The hardware pointer moves in steps of this many frames, so `delay`
-    /// reads stale and high in between. 0 or 1 is exact.
     pub quantum: u64,
-    /// Runs dry without reporting it, as `PipeWire` was measured doing.
+    /// As `PipeWire` was measured doing.
     pub silent_underruns: bool,
     pub busy: bool,
     pub unplugged: bool,
     pub heard: Vec<Heard>,
-    /// Every device opened, in order.
     pub opens: Vec<String>,
-    /// The most the device ever held, which a real one would block on.
     pub max_queued: Duration,
     pub(super) open: Option<Format>,
     pub(super) now: Duration,
@@ -80,11 +68,10 @@ pub(super) struct Format {
     channels: u64,
 }
 
-/// Frame `base` is heard at `from`; the rest follow at the crystal rate.
 #[derive(Clone, Copy)]
 pub(super) struct Run {
-    from: SinceBoot,
-    base: u64,
+    started: SinceBoot,
+    first_frame: u64,
 }
 
 impl Dac {
@@ -107,8 +94,8 @@ impl Dac {
         reason = "a simulated position fits in u64"
     )]
     fn consumed(&self, run: Run, now: SinceBoot) -> u64 {
-        let elapsed = now.0.saturating_sub(run.from.0).as_secs_f64();
-        run.base + (elapsed * self.rate()) as u64
+        let elapsed = now.0.saturating_sub(run.started.0).as_secs_f64();
+        run.first_frame + (elapsed * self.rate()) as u64
     }
 
     #[expect(
@@ -116,8 +103,8 @@ impl Dac {
         reason = "simulated positions stay far below 2^52 frames"
     )]
     fn heard_at(&self, run: Run, frame: u64) -> SinceBoot {
-        let offset = (frame - run.base) as f64 / self.rate();
-        SinceBoot(run.from.0 + Duration::from_secs_f64(offset))
+        let offset = (frame - run.first_frame) as f64 / self.rate();
+        SinceBoot(run.started.0 + Duration::from_secs_f64(offset))
     }
 
     fn queued(&self) -> u64 {
@@ -127,7 +114,7 @@ impl Dac {
         let consumed = self.consumed(run, SinceBoot(self.now)).min(self.written);
         let pointer = match self.quantum {
             0 | 1 => consumed,
-            q => run.base + (consumed - run.base) / q * q,
+            q => run.first_frame + (consumed - run.first_frame) / q * q,
         };
         self.written - pointer
     }
@@ -198,8 +185,8 @@ impl Sink for FakeSink {
             return Err(SinkError::Lost("unplugged".into()));
         }
         let start = Run {
-            from: SinceBoot(dac.now + dac.start_delay),
-            base: dac.written,
+            started: SinceBoot(dac.now + dac.start_delay),
+            first_frame: dac.written,
         };
         let run = *dac.run.get_or_insert(start);
         let count = match frames {

@@ -219,7 +219,6 @@ mod tests {
 
     use super::*;
     use crate::config::Server;
-    use crate::player::Output;
     use crate::tests::{desired, logs};
     use crate::transport::Tcp;
 
@@ -252,7 +251,7 @@ mod tests {
         configure: impl FnOnce(&mut Link<Tcp, R>) + Send + 'static,
     ) {
         thread::spawn(move || {
-            let device = Device::new(Output::Alsa, logs());
+            let device = Device::new(crate::player::fake::Unavailable, logs());
             let mut link = Link::new(Tcp, server, BACKOFF, hello(), device);
             configure(&mut link);
             link.run()

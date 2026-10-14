@@ -1,11 +1,12 @@
 //! The audio thread: hold chunks until their deadline, then write them to
 //! the output.
 
+#[cfg(test)]
+pub(crate) mod fake;
+mod sink;
+mod wav;
+
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -19,6 +20,9 @@ use bounce_common::time::SinceBoot;
 use bounce_common::zone::Volume;
 
 use crate::clock::{self, SharedOffset};
+
+pub use sink::{Clock, Frames, OpenError, Output, Sink, SinkError};
+pub use wav::{WavOutput, WavStream};
 
 pub struct PlayerHandle {
     tx: Sender<PlayerInput>,
@@ -56,54 +60,29 @@ pub struct PlaybackCounters {
     pub buffered_us: AtomicU64,
 }
 
-pub struct Player {
-    state: State,
+pub struct Player<O: Output> {
+    state: State<O::Sink>,
     buffer: VecDeque<AudioChunk>,
-    output: Output,
+    output: O,
     settings: OutputSettings,
     clock: SharedOffset,
     counters: Arc<PlaybackCounters>,
     changes: Sender<PlayerState>,
+    /// Reused for gain, so steady playback does not allocate.
+    scratch: Vec<i16>,
 }
 
-enum State {
+enum State<S> {
     Idle,
-    Buffering(Track),
-    Playing { track: Track, cursor: SinceBoot },
+    Buffering(Track<S>),
+    Playing { track: Track<S>, cursor: SinceBoot },
     OutputUnavailable { device: String },
 }
 
-struct Track {
+struct Track<S> {
     stream: StreamId,
     format: AudioFormat,
-    wav: WavStream,
-}
-
-pub enum Output {
-    Alsa,
-    Wav(WavOutput),
-}
-
-/// Writes in real time, paced by the same deadlines, so underrun padding
-/// and volume land in the file exactly as they would at the DAC.
-///
-/// Each stream gets `<dir>/stream-<id>.wav`, 16-bit PCM behind the canonical
-/// 44-byte header (sizes rewritten after every write, so the file is
-/// readable while the client runs), and `<dir>/stream-<id>.timing`, one
-/// `<first frame> <play_at us> <wall us>` line per chunk written, where
-/// `wall us` is when that frame reaches the listener on the host wall clock.
-/// Starting a stream whose files exist appends to them.
-pub struct WavOutput {
-    pub dir: PathBuf,
-    pub wall_origin_us: u64,
-}
-
-struct WavStream {
-    wav: File,
-    timing: File,
-    frames: u64,
-    block_align: u16,
-    wall_origin_us: u64,
+    sink: S,
 }
 
 /// No resampling: the WAV sink is paced by the deadlines and loopback has no
@@ -120,16 +99,16 @@ impl PlayerHandle {
     ///
     /// If the OS cannot start a thread.
     #[must_use]
-    pub fn spawn(clock: SharedOffset, output: Output) -> Self {
+    pub fn spawn<O: Output + Send + 'static>(clock: SharedOffset, output: O) -> Self {
         let (tx, rx) = mpsc::channel();
         let (changes, states) = mpsc::channel();
         let counters = Arc::<PlaybackCounters>::default();
         let queued = Arc::<AtomicUsize>::default();
-        let player = Player::new(clock, output, Arc::clone(&counters), changes);
+        let player_counters = Arc::clone(&counters);
         let taken = Arc::clone(&queued);
         thread::Builder::new()
             .name("audio".into())
-            .spawn(move || player.run(&rx, &taken))
+            .spawn(move || Player::new(clock, output, player_counters, changes).run(&rx, &taken))
             .expect("spawning the audio thread");
         Self {
             tx,
@@ -163,10 +142,10 @@ impl PlayerHandle {
     }
 }
 
-impl Player {
+impl<O: Output> Player<O> {
     fn new(
         clock: SharedOffset,
-        output: Output,
+        output: O,
         counters: Arc<PlaybackCounters>,
         changes: Sender<PlayerState>,
     ) -> Self {
@@ -183,6 +162,7 @@ impl Player {
             clock,
             counters,
             changes,
+            scratch: Vec::new(),
         }
     }
 
@@ -222,19 +202,16 @@ impl Player {
                     return;
                 }
                 self.buffer.clear();
-                let state = match &self.output {
-                    Output::Alsa => self.unavailable(),
-                    Output::Wav(output) => match output.open(stream, format) {
-                        Ok(wav) => State::Buffering(Track {
-                            stream,
-                            format,
-                            wav,
-                        }),
-                        Err(error) => {
-                            tracing::error!(%error, dir = %output.dir.display(), "cannot open WAV");
-                            self.unavailable()
-                        }
-                    },
+                let state = match self.output.open(&self.settings.device, stream, format) {
+                    Ok(sink) => State::Buffering(Track {
+                        stream,
+                        format,
+                        sink,
+                    }),
+                    Err(OpenError(error)) => {
+                        tracing::error!(device = self.settings.device, %error, "cannot open the output");
+                        self.unavailable()
+                    }
                 };
                 self.enter(state);
             }
@@ -261,7 +238,11 @@ impl Player {
         wake
     }
 
-    fn buffering(&mut self, track: Track, now: SinceBoot) -> (State, Option<SinceBoot>) {
+    fn buffering(
+        &mut self,
+        track: Track<O::Sink>,
+        now: SinceBoot,
+    ) -> (State<O::Sink>, Option<SinceBoot>) {
         loop {
             let Some(chunk) = self.buffer.front() else {
                 return (State::Buffering(track), None);
@@ -281,14 +262,14 @@ impl Player {
 
     fn playing(
         &mut self,
-        mut track: Track,
+        mut track: Track<O::Sink>,
         mut cursor: SinceBoot,
         now: SinceBoot,
-    ) -> (State, Option<SinceBoot>) {
+    ) -> (State<O::Sink>, Option<SinceBoot>) {
         match self.write_due(&mut track, &mut cursor, now) {
             Ok(()) => (State::Playing { track, cursor }, Some(cursor)),
-            Err(error) => {
-                tracing::error!(%error, "cannot write WAV");
+            Err(SinkError::Lost(error)) => {
+                tracing::error!(device = self.settings.device, %error, "output lost");
                 (self.unavailable(), None)
             }
         }
@@ -296,16 +277,16 @@ impl Player {
 
     fn write_due(
         &mut self,
-        track: &mut Track,
+        track: &mut Track<O::Sink>,
         cursor: &mut SinceBoot,
         now: SinceBoot,
-    ) -> io::Result<()> {
+    ) -> Result<(), SinkError> {
         let rate = track.format.sample_rate;
+        let channels = u64::from(track.format.channels);
         let gain = self.gain();
         if now > after(*cursor, MAX_BEHIND) {
-            track
-                .wav
-                .silence(frames_in(now.0.saturating_sub(cursor.0), rate))?;
+            let frames = frames_in(now.0.saturating_sub(cursor.0), rate);
+            track.sink.write(Frames::Silence { frames })?;
             self.counters.underruns.fetch_add(1, Ordering::Relaxed);
             *cursor = now;
         }
@@ -315,13 +296,22 @@ impl Player {
                 Some(d) if after(d, TOLERANCE) < *cursor => self.drop_late(),
                 Some(d) if d <= after(*cursor, TOLERANCE) => {
                     let chunk = self.buffer.pop_front().expect("deadline came from a chunk");
-                    let heard = after(*cursor, self.settings.latency);
-                    let frames = track.wav.chunk(&chunk, gain, heard)?;
+                    self.scratch.clear();
+                    let samples = chunk.data.as_chunks::<2>().0;
+                    self.scratch
+                        .extend(samples.iter().map(|&s| scale(i16::from_le_bytes(s), gain)));
+                    track.sink.write(Frames::Audio {
+                        pcm: &self.scratch,
+                        play_at: chunk.play_at,
+                        heard: after(*cursor, self.settings.latency),
+                    })?;
+                    let frames = self.scratch.len() as u64 / channels;
                     *cursor = after(*cursor, duration_of(frames, rate));
                 }
                 gap => {
                     let silence = gap.map_or(PERIOD, |d| d.0.saturating_sub(cursor.0).min(PERIOD));
-                    let frames = track.wav.silence(frames_in(silence, rate))?;
+                    let frames = frames_in(silence, rate);
+                    track.sink.write(Frames::Silence { frames })?;
                     self.counters.underruns.fetch_add(1, Ordering::Relaxed);
                     *cursor = after(*cursor, duration_of(frames, rate));
                 }
@@ -352,17 +342,17 @@ impl Player {
         let Some(track) = self.state.track() else {
             return 0;
         };
-        let frames = chunk.data.len() as u64 / u64::from(track.wav.block_align);
+        let frames = chunk.data.len() as u64 / (2 * u64::from(track.format.channels));
         frames * 1_000_000 / u64::from(track.format.sample_rate)
     }
 
-    fn unavailable(&self) -> State {
+    fn unavailable(&self) -> State<O::Sink> {
         State::OutputUnavailable {
             device: self.settings.device.clone(),
         }
     }
 
-    fn enter(&mut self, state: State) {
+    fn enter(&mut self, state: State<O::Sink>) {
         let before = self.state.reported();
         self.state = state;
         self.announce(before);
@@ -376,8 +366,8 @@ impl Player {
     }
 }
 
-impl State {
-    fn track(&self) -> Option<&Track> {
+impl<S> State<S> {
+    fn track(&self) -> Option<&Track<S>> {
         match self {
             Self::Buffering(track) | Self::Playing { track, .. } => Some(track),
             Self::Idle | Self::OutputUnavailable { .. } => None,
@@ -404,100 +394,6 @@ impl State {
     }
 }
 
-const HEADER_LEN: u64 = 44;
-
-impl WavOutput {
-    fn open(&self, stream: StreamId, format: AudioFormat) -> io::Result<WavStream> {
-        std::fs::create_dir_all(&self.dir)?;
-        let base = self.dir.join(format!("stream-{}", stream.0));
-        let wav = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(base.with_extension("wav"))?;
-        let timing = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(base.with_extension("timing"))?;
-        let block_align = 2 * u16::from(format.channels);
-        let data_len = wav.metadata()?.len().saturating_sub(HEADER_LEN);
-        let stream = WavStream {
-            wav,
-            timing,
-            frames: data_len / u64::from(block_align),
-            block_align,
-            wall_origin_us: self.wall_origin_us,
-        };
-        stream.wav.set_len(HEADER_LEN + stream.data_len())?;
-        stream.write_header(format)?;
-        Ok(stream)
-    }
-}
-
-impl WavStream {
-    fn chunk(&mut self, chunk: &AudioChunk, gain: i32, heard: SinceBoot) -> io::Result<u64> {
-        let first = self.frames;
-        let pcm: Vec<u8> = chunk
-            .data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .flat_map(|&s| scale(i16::from_le_bytes(s), gain).to_le_bytes())
-            .collect();
-        let frames = self.append(&pcm)?;
-        let wall = self.wall_origin_us + u64::try_from(heard.0.as_micros()).unwrap_or(u64::MAX);
-        writeln!(self.timing, "{first} {} {wall}", chunk.play_at.0)?;
-        Ok(frames)
-    }
-
-    fn silence(&mut self, frames: u64) -> io::Result<u64> {
-        let len = usize::try_from(frames * u64::from(self.block_align)).expect("fits in memory");
-        self.append(&vec![0; len])
-    }
-
-    fn append(&mut self, pcm: &[u8]) -> io::Result<u64> {
-        self.wav.write_all_at(pcm, HEADER_LEN + self.data_len())?;
-        let frames = pcm.len() as u64 / u64::from(self.block_align);
-        self.frames += frames;
-        let data_len = size_field(self.data_len());
-        self.wav.write_all_at(&(data_len + 36).to_le_bytes(), 4)?;
-        self.wav.write_all_at(&data_len.to_le_bytes(), 40)?;
-        Ok(frames)
-    }
-
-    fn data_len(&self) -> u64 {
-        self.frames * u64::from(self.block_align)
-    }
-
-    fn write_header(&self, format: AudioFormat) -> io::Result<()> {
-        let data_len = size_field(self.data_len());
-        let byte_rate = format.sample_rate * u32::from(self.block_align);
-        let mut header = Vec::with_capacity(44);
-        header.extend_from_slice(b"RIFF");
-        header.extend_from_slice(&(data_len + 36).to_le_bytes());
-        header.extend_from_slice(b"WAVEfmt ");
-        header.extend_from_slice(&16_u32.to_le_bytes());
-        header.extend_from_slice(&1_u16.to_le_bytes());
-        header.extend_from_slice(&u16::from(format.channels).to_le_bytes());
-        header.extend_from_slice(&format.sample_rate.to_le_bytes());
-        header.extend_from_slice(&byte_rate.to_le_bytes());
-        header.extend_from_slice(&self.block_align.to_le_bytes());
-        header.extend_from_slice(&16_u16.to_le_bytes());
-        header.extend_from_slice(b"data");
-        header.extend_from_slice(&data_len.to_le_bytes());
-        self.wav.write_all_at(&header, 0)
-    }
-}
-
-/// A WAV past 4 GiB of data, about six hours of 48 kHz stereo, keeps
-/// playing with its size fields pinned at the maximum.
-fn size_field(data_len: u64) -> u32 {
-    u32::try_from(data_len)
-        .unwrap_or(u32::MAX - 36)
-        .min(u32::MAX - 36)
-}
-
 fn scale(sample: i16, gain: i32) -> i16 {
     i16::try_from(i32::from(sample) * gain / 100).expect("gain is at most 100")
 }
@@ -516,6 +412,8 @@ fn duration_of(frames: u64, rate: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use bounce_common::audio::Codec;
     use bounce_common::time::{ClockOffset, ServerInstant};
 
@@ -530,7 +428,7 @@ mod tests {
     const FRAMES: usize = 480;
 
     struct Rig {
-        player: Player,
+        player: Player<WavOutput>,
         changes: Receiver<PlayerState>,
         dir: PathBuf,
     }
@@ -543,10 +441,10 @@ mod tests {
         let (changes_tx, changes) = mpsc::channel();
         let mut player = Player::new(
             clock,
-            Output::Wav(WavOutput {
+            WavOutput {
                 dir: dir.clone(),
                 wall_origin_us: 0,
-            }),
+            },
             Arc::default(),
             changes_tx,
         );
@@ -829,11 +727,11 @@ mod tests {
     }
 
     #[test]
-    fn alsa_reports_its_device_unavailable() {
+    fn an_output_that_cannot_open_reports_its_device_unavailable() {
         let (changes_tx, changes) = mpsc::channel();
         let mut player = Player::new(
             SharedOffset::default(),
-            Output::Alsa,
+            fake::Unavailable,
             Arc::default(),
             changes_tx,
         );

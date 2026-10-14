@@ -55,7 +55,7 @@ const MAX_LOG_BATCH: usize = 64;
 
 impl Device {
     #[must_use]
-    pub fn new(output: Output, logs: Arc<Mutex<LogBuffer>>) -> Self {
+    pub fn new(output: impl Output + Send + 'static, logs: Arc<Mutex<LogBuffer>>) -> Self {
         let clock = ClockSync::default();
         let player = PlayerHandle::spawn(clock.shared(), output);
         Self {
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn tick_sends_unacked_logs_until_an_ack_for_this_boot() {
         let logs = logs();
-        let mut device = Device::new(Output::Alsa, logs.clone());
+        let mut device = Device::new(player::fake::Unavailable, logs.clone());
         log(&logs, Level::Info);
         log(&logs, Level::Info);
         assert_eq!(log_seqs(&device.tick(at(0))), Some(vec![1, 2]));
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn desired_sets_the_level_of_buffered_logs() {
         let logs = logs();
-        let mut device = Device::new(Output::Alsa, logs.clone());
+        let mut device = Device::new(player::fake::Unavailable, logs.clone());
         let quiet = DesiredState {
             log_level: Level::Warn,
             ..desired(1)
@@ -244,7 +244,7 @@ mod tests {
         let logs = logs();
         let subscriber = tracing_subscriber::registry().with(ForwardLayer::new(logs.clone()));
         tracing::subscriber::with_default(subscriber, || {
-            let mut device = Device::new(Output::Alsa, logs.clone());
+            let mut device = Device::new(player::fake::Unavailable, logs.clone());
             let verbose = DesiredState {
                 log_level: Level::Trace,
                 ..desired(1)
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn desired_is_reported_applied_and_idle() {
-        let mut device = Device::new(Output::Alsa, logs());
+        let mut device = Device::new(player::fake::Unavailable, logs());
         let out = device.on_message(ServerMessage::Desired(desired(3)), at(0));
         assert!(
             matches!(
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn tick_sends_at_most_one_time_sync_per_second() {
-        let mut device = Device::new(Output::Alsa, logs());
+        let mut device = Device::new(player::fake::Unavailable, logs());
         let syncs = |out: Vec<ClientMessage>| {
             out.iter()
                 .filter(|m| matches!(m, ClientMessage::TimeSync(_)))
@@ -322,10 +322,10 @@ mod tests {
     fn reports_buffering_then_playing_for_the_desired_stream_then_idle() {
         let dir = std::env::temp_dir().join(format!("bounce-device-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let output = Output::Wav(WavOutput {
+        let output = WavOutput {
             dir: dir.clone(),
             wall_origin_us: 0,
-        });
+        };
         let mut device = Device::new(output, logs());
         let now = clock::now();
         let server_now = ServerInstant(u64::try_from(now.0.as_micros()).unwrap());

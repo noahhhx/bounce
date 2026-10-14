@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 use bounce_client::clock;
 use bounce_client::config::{Config, OutputBackend};
 use bounce_client::link::{Backoff, Link};
-use bounce_client::player::{Output, WavOutput};
+use bounce_client::player::{OpenError, Output, WavOutput, WavStream};
 use bounce_client::telemetry::{ForwardLayer, LogBuffer, LOG_CAPACITY};
 use bounce_client::transport::Tcp;
 use bounce_client::Device;
-use bounce_common::audio::Codec;
-use bounce_common::ids::{BootId, Version};
+use bounce_common::audio::{AudioFormat, Codec};
+use bounce_common::ids::{BootId, StreamId, Version};
 use bounce_common::protocol::{Hello, OutputDevice, PROTOCOL_VERSION};
 use bounce_common::update::Target;
 use tracing::info;
@@ -44,32 +44,50 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let server = config.server;
+    match config.output {
+        OutputBackend::Alsa => run(&config, boot, logs, NoAlsa),
+        OutputBackend::Wav { ref dir } => {
+            let output = WavOutput {
+                dir: dir.clone(),
+                wall_origin_us: clock::wall_origin_micros(),
+            };
+            run(&config, boot, logs, output)
+        }
+    }
+}
 
-    let hello = hello(&config, boot);
+fn run(
+    config: &Config,
+    boot: BootId,
+    logs: Arc<Mutex<LogBuffer>>,
+    output: impl Output + Send + 'static,
+) -> ExitCode {
+    let hello = hello(config, boot, output.devices());
+    let server = config.server;
     info!(client = ?hello.client, boot = hello.boot.0, ?server, "starting");
-    let output = match config.output {
-        OutputBackend::Alsa => Output::Alsa,
-        OutputBackend::Wav { dir } => Output::Wav(WavOutput {
-            dir,
-            wall_origin_us: clock::wall_origin_micros(),
-        }),
-    };
     let device = Device::new(output, logs);
     Link::new(Tcp, server, Backoff::default(), hello, device).run()
 }
 
-fn hello(config: &Config, boot: BootId) -> Hello {
-    let output = match &config.output {
-        OutputBackend::Alsa => OutputDevice {
+/// The ALSA output is not built yet, so the player reports it unavailable.
+struct NoAlsa;
+
+impl Output for NoAlsa {
+    type Sink = WavStream;
+
+    fn devices(&self) -> Vec<OutputDevice> {
+        vec![OutputDevice {
             id: "default".into(),
             description: "ALSA default device".into(),
-        },
-        OutputBackend::Wav { dir } => OutputDevice {
-            id: "wav".into(),
-            description: format!("WAV files in {}", dir.display()),
-        },
-    };
+        }]
+    }
+
+    fn open(&self, _: &str, _: StreamId, _: AudioFormat) -> Result<WavStream, OpenError> {
+        Err(OpenError("the ALSA output is not built".into()))
+    }
+}
+
+fn hello(config: &Config, boot: BootId, outputs: Vec<OutputDevice>) -> Hello {
     Hello {
         protocol: PROTOCOL_VERSION,
         client: config.client_id.clone(),
@@ -81,7 +99,7 @@ fn hello(config: &Config, boot: BootId) -> Hello {
         },
         target: TARGET,
         hostname: hostname(),
-        outputs: vec![output],
+        outputs,
         codecs: vec![Codec::PcmS16Le],
     }
 }

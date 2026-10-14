@@ -37,8 +37,8 @@ pub enum Correction {
 /// About half a second of steps, enough for the minimum to find a fresh
 /// reading on a driver that moves its pointer once per period.
 const WINDOW: usize = 100;
-/// Before anything is heard a wrong jump costs nothing. A short window is
-/// enough to see a start-up error as large as `PipeWire`'s 60 ms.
+/// Enough readings to tell settled from still moving while priming, as
+/// after `PipeWire`'s measured 60 ms start delay.
 const PRIME_WINDOW: usize = 10;
 /// The window minimum still reads up to a fraction of a period high, and
 /// that adds to whatever the deadband lets through.
@@ -63,26 +63,30 @@ impl DeviceClock {
         self.readings.push_back(error - self.applied);
     }
 
-    /// `priming` while nothing has been heard since the device started. Then
-    /// the newest few readings may jump a large error away, and a full
-    /// window jumps anything past the deadband. Once playing, only a full
-    /// window acts, since a jump is heard.
+    /// `priming` while nothing has been heard since the device started, so
+    /// a jump costs nothing. Then a few readings that agree within the
+    /// deadband are trusted at once, a few that still move or scatter may
+    /// only jump a large error away, and a full window jumps anything past
+    /// the deadband. Once playing, only a full window acts.
     #[must_use]
     pub fn correction(&self, priming: bool) -> Correction {
-        let full = self.readings.len() == WINDOW;
-        let window = match (full, priming) {
-            (true, _) => WINDOW,
-            (false, true) if self.readings.len() >= PRIME_WINDOW => PRIME_WINDOW,
-            (false, _) => return Correction::None,
+        let deadband = self.frames(DEADBAND);
+        let step = self.frames(STEP);
+        let (window, jump) = match (self.readings.len(), priming) {
+            (WINDOW, true) => (WINDOW, deadband),
+            (WINDOW, false) => (WINDOW, step),
+            (len, true) if len >= PRIME_WINDOW => {
+                let newest = || self.readings.iter().rev().take(PRIME_WINDOW);
+                let spread = newest().max().unwrap_or(&0) - newest().min().unwrap_or(&0);
+                (
+                    PRIME_WINDOW,
+                    if spread <= deadband { deadband } else { step },
+                )
+            }
+            _ => return Correction::None,
         };
         let newest = self.readings.iter().rev().take(window);
         let error = newest.min().expect("the window holds readings") + self.applied;
-        let deadband = self.frames(DEADBAND);
-        let jump = if priming && full {
-            deadband
-        } else {
-            self.frames(STEP)
-        };
         match error {
             e if e < -jump => Correction::Pad(e.unsigned_abs()),
             e if e > jump => Correction::Skip(e.unsigned_abs()),
@@ -180,6 +184,19 @@ mod tests {
             clock_after(&readings).correction(false),
             Correction::None,
             "but not once playing"
+        );
+        assert_eq!(
+            clock_after(&[30; PRIME_WINDOW]).correction(true),
+            Correction::Skip(30),
+            "a few readings that agree place the first chunk exactly"
+        );
+        let scattered: Vec<i64> = (0..PRIME_WINDOW)
+            .map(|i| if i % 2 == 0 { 30 } else { 530 })
+            .collect();
+        assert_eq!(
+            clock_after(&scattered).correction(true),
+            Correction::Squeeze,
+            "a few scattered readings may be stale, so only a slew"
         );
         assert_eq!(
             clock_after(&[30; WINDOW]).correction(true),

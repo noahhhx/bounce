@@ -5,12 +5,14 @@ use std::sync::{Arc, Mutex};
 use bounce_client::clock;
 use bounce_client::config::{Config, OutputBackend};
 use bounce_client::link::{Backoff, Link};
-use bounce_client::player::{OpenError, Output, WavOutput, WavStream};
+#[cfg(target_os = "linux")]
+use bounce_client::player::AlsaOutput;
+use bounce_client::player::{Output, WavOutput};
 use bounce_client::telemetry::{ForwardLayer, LogBuffer, LOG_CAPACITY};
 use bounce_client::transport::Tcp;
 use bounce_client::Device;
-use bounce_common::audio::{AudioFormat, Codec};
-use bounce_common::ids::{BootId, StreamId, Version};
+use bounce_common::audio::Codec;
+use bounce_common::ids::{BootId, Version};
 use bounce_common::protocol::{Hello, OutputDevice, PROTOCOL_VERSION};
 use bounce_common::update::Target;
 use tracing::info;
@@ -45,7 +47,13 @@ fn main() -> ExitCode {
         }
     };
     match config.output {
-        OutputBackend::Alsa => run(&config, boot, logs, NoAlsa),
+        #[cfg(target_os = "linux")]
+        OutputBackend::Alsa => run(&config, boot, logs, AlsaOutput),
+        #[cfg(not(target_os = "linux"))]
+        OutputBackend::Alsa => {
+            eprintln!("bounce-client: built without ALSA, use --output wav:<dir>");
+            ExitCode::from(2)
+        }
         OutputBackend::Wav { ref dir } => {
             let output = WavOutput {
                 dir: dir.clone(),
@@ -67,24 +75,6 @@ fn run(
     info!(client = ?hello.client, boot = hello.boot.0, ?server, "starting");
     let device = Device::new(output, logs);
     Link::new(Tcp, server, Backoff::default(), hello, device).run()
-}
-
-/// The ALSA output is not built yet, so the player reports it unavailable.
-struct NoAlsa;
-
-impl Output for NoAlsa {
-    type Sink = WavStream;
-
-    fn devices(&self) -> Vec<OutputDevice> {
-        vec![OutputDevice {
-            id: "default".into(),
-            description: "ALSA default device".into(),
-        }]
-    }
-
-    fn open(&self, _: &str, _: StreamId, _: AudioFormat) -> Result<WavStream, OpenError> {
-        Err(OpenError("the ALSA output is not built".into()))
-    }
 }
 
 fn hello(config: &Config, boot: BootId, outputs: Vec<OutputDevice>) -> Hello {

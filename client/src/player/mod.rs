@@ -1,6 +1,8 @@
 //! The audio thread: hold chunks until their deadline, then write them to
 //! the output.
 
+#[cfg(target_os = "linux")]
+mod alsa_output;
 mod drift;
 #[cfg(test)]
 pub(crate) mod fake;
@@ -23,6 +25,8 @@ use bounce_common::zone::Volume;
 use crate::clock::{self, SharedOffset};
 use drift::{Correction, DeviceClock};
 
+#[cfg(target_os = "linux")]
+pub use alsa_output::{AlsaOutput, AlsaSink};
 pub use sink::{Clock, Frames, OpenError, Output, Sink, SinkError, WRITE_AHEAD};
 pub use wav::{WavOutput, WavStream};
 
